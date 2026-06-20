@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omniem"
+dynamic = ["version"]
+description = "Inference and utilities for EM-specific encoders and OmniEM models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Liuyuan He", email = "liyhe@pku.edu.cn" }]
+dependencies = [
+    # torch wheels are platform-/CUDA-specific; this declares a floor only. On
+    # HPC / specific CUDA targets, install torch separately first.
+    "torch>=2.3",
+    "numpy>=1.24",
+    "tifffile>=2023.1.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "monai>=1.2,<2",
+]
+
+[project.scripts]
+omniem = "omniem.cli:main"
+
+# Version is read from omniem/__init__.py (__version__); the build does not import
+# the package, so it needs no runtime deps.
+[tool.hatch.version]
+path = "omniem/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["omniem"]

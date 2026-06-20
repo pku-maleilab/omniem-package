@@ -1,0 +1,33 @@
+/weights/
+/configs/
+/out/
+
+*.pyc
+*.txt
+# requirements-dev.txt is tracked dev tooling, NOT a runtime data file — it must NOT
+# match the broad `*.txt` rule above (otherwise a fresh clone has no dev-deps file).
+!requirements-dev.txt
+*.pth
+*~
+
+build/
+dist/
+*.egg-info/
+**/__pycache__/
+
+# Generated API docs — pdoc HTML built by scripts/build_docs.sh. A build
+# artifact regenerated from the docstrings on demand; never committed.
+/docs/api/
+
+# Codex-review fix #5: local agent / tooling state. These dirs contain user-/
+# machine-specific settings (Claude Code permissions, Codex profile) and must not
+# be committed.
+.claude/
+.codex/
+
+# Editor / pytest / ruff caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.vscode/
+.idea/
