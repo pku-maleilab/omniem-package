@@ -1,30 +1,25 @@
-"""omniem-driven forward pass for the DINOv2 backbone.
+"""omniem-driven forward pass for the DINOv2 backbone (channel-less, two-stage).
 
 This module reimplements the backbone's ``forward_features`` loop so it can host
 the omniem block hook (``block_callback``) and the public ``inner=`` taps. The
 underlying vendored class is **not** edited.
 
-What ``forward_features`` does (compared to upstream):
+The 0.1.1 *unify-io* redesign split the pass into two explicit stages, both
+**channel-less** (EM is grayscale — the caller never declares a ``c`` axis):
 
-* drives the loop explicitly (rather than ``model.forward_features``) so a
-  ``block_callback(i, x) -> x`` runs **after** block ``i`` and **feeds** block ``i+1``
-  The callback is **shape-preserving** — a cheap per-block ``.shape``
-  compare raises :class:`~omniem.errors.InputContractError` on a mismatch
-  with a clear error.
-* lets the caller pick **which fields to return** via three independent flags
-  (``return_cls`` / ``return_patch`` / ``return_blocks``) — the prior ``want=``
-  tuple + ``blocks=`` selector are gone. All-false (nothing requested) is a
-  contract error.
-* exposes raw **per-block pre-norm** features via ``return_blocks=[i, j, ...]``;
-  the returned ``inner`` is always a dict keyed by block index.
-* applies the **grayscale-only ("gray0") input-transform contract**: a ``c`` axis
-  in ``axes`` is rejected (the encoder synthesises the backbone's channel layout
-  itself — gray0 → repeat to ``in_chans``); then ``(x − mean) / std`` driven by
-  ``norm=`` (None → config default, ``'prenormalized'`` → skip, ``{'mean','std'}``
-  → override); axes folding
-  (``b z y x`` → ``b*z`` so the encoder stays strictly 2D); square + patch-aligned
-  XY enforcement. See ``docs/input-format.md`` for the
-  user-facing rules.
+* :func:`prepare_encoder_input` — the prep stage. Validates ``axes`` (``c``
+  rejected), reorders the caller's input into the canonical ``[b, z, y, x]``
+  layout (``z`` explicit, ``z=1`` for a 2D tile), captures the pre-conform XY as
+  ``orig_yx``, conforms XY (``strict`` / ``resize``; ``pad`` is rejected here),
+  and applies the **scalar** ``(x − mean) / std`` affine. It returns a plain
+  ``(tensor, orig_yx)`` — **no** ``Prepared`` carrier, **no** channel synthesis,
+  **no** ``B*Z`` fold (those are compute concerns now).
+* :func:`compute_encoder` — the compute stage. Strict-validates the canonical
+  ``[b, z, y, x]`` tensor (float, rank, square + patch-aligned XY), folds
+  ``(B, Z) → B*Z`` so the blocks stay strictly 2D, synthesises the channel axis
+  (gray → ``in_chans`` repeat), drives the block loop (``block_callback`` sees the
+  folded ``[B*Z, tokens, dim]``), then **un-folds** every output back to explicit
+  ``[B, Z, …]`` and applies the ``squeeze`` directive (drop singleton ``b`` / ``z``).
 
 The return shape is a flat dict — adapters / heads are NOT part of this signature
 (they live in head-owned wrappers).
@@ -41,15 +36,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from omniem._pipeline import parse_squeeze
 from omniem.errors import InputContractError, OmniEMWarning
-from omniem.prepared import Prepared
 
 # ``norm=`` accepts one of four shapes (replacing the old
 # mean=/std=/transform= trio):
 #   * None            → use the arch ``mean`` / ``std`` (passed in);
 #   * 'prenormalized' → skip the affine (the caller already did it);
 #   * 'per-image'     → per-sample z-score (x - mean(x)) / std(x);
-#   * {'mean', 'std'} → override (both keys required).
+#   * {'mean', 'std'} → SCALAR override (both keys required; sequences rejected).
 # The literal strings the caller passes.
 _PRENORMALIZED = "prenormalized"
 _PER_IMAGE = "per-image"
@@ -86,29 +81,24 @@ def _per_image_stats(x_preconform: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return mean, std
 
 
-def _warn_values_out_of_unit_range(value: float | Sequence[float], *, what: str) -> None:
-    """Warn (never raise) if a scalar / per-channel ``mean`` or ``std`` ∉ ``[0,1]``.
+def _warn_values_out_of_unit_range(value: float, *, what: str) -> None:
+    """Warn (never raise) if a scalar ``mean`` or ``std`` ∉ ``[0,1]``.
 
-    Accepts scalar OR per-channel sequence and iterates. One warning
-    per call is enough.
+    Norm is scalar-only post-0.1.1, so this takes a single scalar.
     """
-    seq: Sequence[float]
     if isinstance(value, (str, bytes, bytearray)):
         return
-    seq = value if isinstance(value, Sequence) else [value]  # type: ignore[assignment]
-    for v in seq:
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            continue
-        if f < -_UNIT_RANGE_TOL or f > 1.0 + _UNIT_RANGE_TOL:
-            warnings.warn(
-                f"{what}={f} is outside [0,1]; omniem normalizes a [0,1]-scaled "
-                f"input. If this is a raw 0-255 stat, divide by 255.",
-                category=OmniEMWarning,
-                stacklevel=3,
-            )
-            return
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return
+    if f < -_UNIT_RANGE_TOL or f > 1.0 + _UNIT_RANGE_TOL:
+        warnings.warn(
+            f"{what}={f} is outside [0,1]; omniem normalizes a [0,1]-scaled "
+            f"input. If this is a raw 0-255 stat, divide by 255.",
+            category=OmniEMWarning,
+            stacklevel=3,
+        )
 
 
 def _warn_tensor_out_of_unit_range(x: torch.Tensor, *, what: str) -> None:
@@ -132,191 +122,43 @@ def _warn_tensor_out_of_unit_range(x: torch.Tensor, *, what: str) -> None:
             stacklevel=3,
         )
 
+
 # Accepted axes characters. ``b z y x`` is the production set; ``c`` (channel) is
 # **rejected** under the gray0 contract — the encoder synthesises the
 # channel layout itself (see ``docs/input-format.md``).
 _AXES_VALID: frozenset[str] = frozenset({"b", "z", "y", "x"})
 
-# Acceptable axes precedence: a leading 'b' (when present) must be the first character
-# — anything else would make the fold-z semantics ambiguous.
-
 
 # --------------------------------------------------------------------------------------
-# Public forward entry point.
+# Stage 1: prep (axes fold → conform → scalar norm) → channel-less ``[b, z, y, x]``.
 # --------------------------------------------------------------------------------------
 
 
-def forward_features(
+def prepare_encoder_input(
     backbone: nn.Module,
     x: torch.Tensor,
     *,
     axes: str,
     mean: float,
     std: float,
-    return_cls: bool = True,
-    return_patch: bool = False,
-    return_blocks: Sequence[int] | None = None,
-    block_callback: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
-    norm: None | str | Mapping[str, float | Sequence[float]] = None,
-) -> dict[str, Any]:
-    """Run the omniem-driven forward pass on a built backbone.
+    norm: None | str | Mapping[str, float] = None,
+    conform: str = "strict",
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Run the prep stage — return a channel-less canonical ``[b, z, y, x]`` tensor.
 
-    See module docstring for the high-level contract. The signature uses
-    independent ``return_*`` flags — the prior ``want``/``blocks``
-    coupling is gone.
+    The prep-only half of the encoder forward: axes validate + canonicalise + XY
+    conform + scalar mean/std affine. The :class:`~omniem.encoders.base.EMEncoder`
+    wrapper calls this from ``_apply_input`` (and from :meth:`EMEncoder.run`).
 
-    Args:
-        backbone: A built :class:`DinoVisionTransformer`-shaped module. Must expose
-            ``patch_embed``, ``prepare_tokens_with_masks``, ``blocks``, ``norm``,
-            ``num_register_tokens``, ``patch_size``, ``embed_dim``, ``n_blocks``.
-        x: The caller's input tensor. Dim is governed by ``axes``. **Grayscale
-            only** — ``axes`` must not contain ``c``; see ``docs/input-format.md``.
-        axes: A string of one-character axis tags drawn from ``{b, z, y, x}``
-            (whitespace ignored). A ``c`` axis is a contract error. Validation
-            rules in :func:`_parse_axes`.
-        mean/std: The arch's pretraining normalisation (from
-            :func:`omniem.encoders.registry.arch_mean_std`). Used when ``norm`` is
-            ``None``; a ``norm`` dict overrides them; ``norm='prenormalized'`` skips
-            the affine.
-        return_cls: When ``True`` (default), include the cls token in the output.
-        return_patch: When ``True``, include the patch tokens.
-        return_blocks: Optional sequence of block indices to tap. Each must be in
-            ``[0, n_blocks)``; negative indices and out-of-range raise. ``None`` /
-            empty → no taps. The returned ``inner`` dict is keyed by block index
-            Selecting indices both *requests* and *selects* the taps — the
-            former ``want=('inner',)`` requirement is gone.
-        block_callback: Optional ``fn(i, x) -> x`` run after block ``i`` and feeding
-            block ``i+1`` — must be **shape-preserving** (a per-block ``.shape`` check
-            enforces this; B13).
-        norm: The normalisation directive (replaces the old
-            ``mean=``/``std=``/``transform=`` trio):
-
-            * ``None`` (default) → use the arch ``mean`` / ``std``;
-            * ``'prenormalized'`` → skip the affine (caller already normalised);
-            * ``{'mean': m, 'std': s}`` → override the affine; **both** keys are
-              required (a partial dict raises). ``m`` / ``s`` may be scalars or
-              per-channel sequences of length ``in_chans``.
-
-            Anything else (a callable, an unknown string, a partial dict) raises
-            :class:`InputContractError`.
+    Args mirror :func:`compute_encoder` except the return-flag / callback knobs
+    (those belong to compute). ``conform`` defaults to ``'strict'`` (matching
+    :meth:`EMEncoder.run`); the only other accepted value is ``'resize'``
+    (``'pad'`` is rejected).
 
     Returns:
-        A flat dict. ``cls`` ∈ ``[B, C]`` (when ``return_cls``);
-        ``patch`` ∈ ``[B, N_p, C]`` (when ``return_patch``); ``inner`` ∈
-        ``{i: Tensor of shape [B*Z, N_total, C]}`` when ``return_blocks`` is
-        non-empty. ``B`` here is ``B*Z`` after axes fold — the wrapper
-        :class:`EMEncoder` documents this for the caller.
-
-    Raises:
-        InputContractError: when ``axes`` contains ``c`` (gray0 contract); when all
-            three ``return_*`` flags are falsy (no field requested); when a
-            ``return_*`` flag is not a real bool; when ``norm`` is malformed; plus
-            the usual input-contract violations (bad axes, bad blocks,
-            shape-changing callback).
-    """
-    # Finding #3: the return_* flags are documented as **bools** — reject non-bool
-    # so a footgun like ``return_patch="false"`` (truthy string) or ``return_cls=[]``
-    # (falsy) can't silently flip behaviour.
-    for _name, _val in (
-        ("return_cls", return_cls),
-        ("return_patch", return_patch),
-    ):
-        if not isinstance(_val, bool):
-            raise InputContractError(
-                f"`{_name}` must be a bool (got {type(_val).__name__}: {_val!r})"
-            )
-
-    chosen_blocks = _validate_blocks(return_blocks, depth=backbone.n_blocks)
-    # All-false guard (round-2 / B16): silently returning {} would be a bug magnet.
-    # At least one of the four return_* flags must be truthy.
-    if not (return_cls or return_patch or chosen_blocks):
-        raise InputContractError(
-            "forward_features: no output requested — set at least one of "
-            "return_cls / return_patch / return_blocks=[...]."
-        )
-    use_callback = block_callback is not None
-
-    # Step 1: axes fold + channel handling + normalisation -----------------------
-    prepared = _prepare_input(
-        x=x,
-        axes=axes,
-        mean=mean,
-        std=std,
-        patch_size=int(backbone.patch_size),
-        in_chans=_resolve_in_chans(backbone),
-        norm=norm,
-    )
-    x4d = prepared.tensor
-
-    # Step 2: tokens → blocks → norm (the manual forward_features loop) -----------
-    tokens = backbone.prepare_tokens_with_masks(x4d)
-    inner: dict[int, torch.Tensor] = {}
-    for i, blk in enumerate(backbone.blocks):
-        tokens = blk(tokens)
-        # Record the tap BEFORE the callback (tap semantics):
-        # ``inner[i]`` is the **raw** post-block, pre-final-norm feature. A head
-        # adapter callback must NOT contaminate it — otherwise the downstream head
-        # sees the same data the adapter already transformed and the contract folds.
-        # ``.clone()`` guarantees the tap is independent of every later op.
-        if i in chosen_blocks:
-            inner[i] = tokens.clone()
-        if use_callback:
-            # Shape-preserving guard. We capture the pre-callback shape and
-            # compare against the post-callback one — anything else trips the
-            # InputContractError so downstream blocks never see a malformed grid.
-            pre_shape = tokens.shape
-            tokens = block_callback(i, tokens)
-            if not isinstance(tokens, torch.Tensor):
-                raise InputContractError(
-                    f"block_callback({i}, ...) returned {type(tokens).__name__}, "
-                    f"expected torch.Tensor"
-                )
-            if tokens.shape != pre_shape:
-                raise InputContractError(
-                    f"block_callback({i}, ...) is not shape-preserving: "
-                    f"got {tuple(tokens.shape)}, expected {tuple(pre_shape)}"
-                )
-
-    x_norm = backbone.norm(tokens)
-    n_reg = int(backbone.num_register_tokens)
-
-    out: dict[str, Any] = {}
-    if return_cls:
-        out["cls"] = x_norm[:, 0]
-    if return_patch:
-        # Patch tokens follow cls + any register tokens. ``n_reg`` is 0 for emdinov1
-        # (no registers); the offset keeps the slice correct for the backbone's layout.
-        out["patch"] = x_norm[:, 1 + n_reg :]
-    if chosen_blocks:
-        out["inner"] = inner
-    return out
-
-
-# --------------------------------------------------------------------------------------
-# Split surfaces: apply_input + compute on the dinov2 backbone.
-# --------------------------------------------------------------------------------------
-
-
-def apply_input_features(
-    backbone: nn.Module,
-    x: torch.Tensor,
-    *,
-    axes: str,
-    mean: float,
-    std: float,
-    norm: None | str | Mapping[str, float | Sequence[float]] = None,
-    conform: str = "resize",
-) -> Prepared:
-    """Run only the input-transform stage; return the :class:`Prepared` carrier.
-
-    This is the prep-only half of :func:`forward_features` — axes fold + gray0
-    synthesis + mean/std affine + XY conform. The :class:`EMEncoder` wrapper calls
-    this in :meth:`EMEncoder.apply_input`.
-
-    Args mirror :func:`forward_features` except the return-flag / callback knobs
-    (those belong to compute, not prep). ``conform`` defaults to ``'resize'`` for
-    the encoder; the only other accepted value is ``'strict'`` (``'pad'`` is
-    rejected — see :func:`_prepare_input`).
+        ``(canonical, orig_yx)`` — ``canonical`` is the channel-less, normalised
+        ``[B, Z, Y, X]`` tensor (Z explicit, never folded here); ``orig_yx`` is the
+        caller's pre-conform ``(Y, X)``.
     """
     return _prepare_input(
         x=x,
@@ -324,37 +166,48 @@ def apply_input_features(
         mean=mean,
         std=std,
         patch_size=int(backbone.patch_size),
-        in_chans=_resolve_in_chans(backbone),
         norm=norm,
         conform=conform,
     )
 
 
-def compute_features(
+# --------------------------------------------------------------------------------------
+# Stage 2: compute (validate → fold + synth → blocks → un-fold → squeeze).
+# --------------------------------------------------------------------------------------
+
+
+def compute_encoder(
     backbone: nn.Module,
-    prepared: Prepared,
+    tensor: torch.Tensor,
     *,
     return_cls: bool = True,
     return_patch: bool = False,
     return_blocks: Sequence[int] | None = None,
     block_callback: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
+    squeeze: str = "",
 ) -> dict[str, Any]:
-    """Run only the compute stage on an already-:class:`Prepared` tensor.
+    """Run the compute stage on a canonical channel-less ``[b, z, y, x]`` tensor.
 
-    This is the post-prep half of :func:`forward_features`. The
-    :class:`EMEncoder` wrapper calls this when
-    :meth:`EMEncoder.forward` is invoked with a :class:`Prepared` as ``x``
-    (the type is the signal; no ``prepared=`` bool).
+    Strict SHAPE validation (float, rank 4, square + patch-aligned XY) — the
+    normalisation is never inferred. Reads ``(B, Z)``, folds ``B*Z`` for the 2D
+    blocks, synthesises the channel axis (gray → ``in_chans``), runs the block
+    loop (``block_callback`` sees the folded ``[B*Z, tokens, dim]``), then un-folds
+    each output to an explicit ``[B, Z, …]`` and applies ``squeeze`` (drop a
+    singleton ``b`` / ``z``).
 
-    Args mirror :func:`forward_features`'s return-flag block; ``norm``/``axes``
-    are intentionally absent — they were already applied / baked into the
-    :class:`Prepared` upstream.
+    Output shapes (before ``squeeze``): ``cls [B, Z, D]``, ``patch [B, Z, N, D]``,
+    ``inner[i] [B, Z, T, D]``. ``squeeze='bz'`` on a 2D tile (``B=Z=1``) yields
+    ``cls [D]`` / ``patch [N, D]``.
+
+    Raises:
+        InputContractError: a non-tensor / **integer** tensor (scale is never in
+            the package); a non-canonical shape; an unrequested output; a
+            non-bool return flag; an out-of-range ``return_blocks`` index; a
+            shape-changing ``block_callback``; or an invalid ``squeeze``.
     """
-    # Same return-flag bool guard as forward_features.
-    for _name, _val in (
-        ("return_cls", return_cls),
-        ("return_patch", return_patch),
-    ):
+    # return_* bools must be real bools — a footgun like ``return_patch="false"``
+    # (truthy string) or ``return_cls=[]`` (falsy) must not silently flip behaviour.
+    for _name, _val in (("return_cls", return_cls), ("return_patch", return_patch)):
         if not isinstance(_val, bool):
             raise InputContractError(
                 f"`{_name}` must be a bool (got {type(_val).__name__}: {_val!r})"
@@ -363,74 +216,52 @@ def compute_features(
     chosen_blocks = _validate_blocks(return_blocks, depth=backbone.n_blocks)
     if not (return_cls or return_patch or chosen_blocks):
         raise InputContractError(
-            "compute_features: no output requested — set at least one of "
+            "compute_encoder: no output requested — set at least one of "
             "return_cls / return_patch / return_blocks=[...]."
         )
+    drop = parse_squeeze(squeeze)
     use_callback = block_callback is not None
 
-    # Prepared meta validation — guard against a
-    # user-constructed Prepared whose ``conform``/``axes``/``B``/``Z``/``stride``
-    # disagree with the tensor it carries. (Pad is unsupported by the encoder,
-    # ``stride`` is the cross-layer discriminator, etc.)
-    if not isinstance(prepared.axes, str) or not prepared.axes:
+    # --- validate the canonical channel-less [b, z, y, x] tensor ----------------
+    if not isinstance(tensor, torch.Tensor):
         raise InputContractError(
-            f"Prepared.axes must be a non-empty string (got {prepared.axes!r})"
+            f"EMEncoder.forward expects a torch.Tensor (got {type(tensor).__name__})."
         )
-    _parse_axes(prepared.axes)
-    if prepared.conform not in ("resize", "strict"):
-        # The encoder rejects ``pad`` outright; anything else is an
-        # unknown mode.
+    if not torch.is_floating_point(tensor):
         raise InputContractError(
-            f"Encoder Prepared.conform must be 'resize' or 'strict' "
-            f"(got {prepared.conform!r})."
+            f"EMEncoder.forward expects a FLOAT canonical [b, z, y, x] tensor "
+            f"(got dtype={tensor.dtype}); the package never scales int→float "
+            f"(uint8 != ÷255). Use run(image, axes=...) for raw input, or cast first."
+        )
+    if tensor.ndim != 4:
+        raise InputContractError(
+            f"EMEncoder.forward expects a canonical 4D [b, z, y, x] tensor "
+            f"(got ndim={tensor.ndim}, shape={tuple(tensor.shape)}). Build the "
+            f"canonical layout (z=1 for a 2D tile) or use run(image, axes=...)."
+        )
+    B, Z, Y, X = (int(d) for d in tensor.shape)
+    if B <= 0 or Z <= 0 or Y <= 0 or X <= 0:
+        raise InputContractError(
+            f"EMEncoder.forward: empty axis (got B={B}, Z={Z}, Y={Y}, X={X})."
         )
     patch_size = int(backbone.patch_size)
-    if prepared.stride != patch_size:
+    if Y != X or Y % patch_size != 0:
         raise InputContractError(
-            f"Prepared.stride={prepared.stride} disagrees with the backbone's "
-            f"patch_size={patch_size}. Did you feed a model-Prepared (stride=112) "
-            f"to the encoder?"
+            f"EMEncoder.forward: XY must be square + a multiple of patch_size="
+            f"{patch_size} (got {Y}x{X}); conform via run(image, axes=..., "
+            f"conform='resize')."
         )
 
-    # Prepared tensor validation. The encoder-prepared
-    # carrier MUST be 4D float ``[B*Z, in_chans, S, S]`` with square stride-aligned XY.
-    x4d = prepared.tensor
-    if not isinstance(x4d, torch.Tensor):
-        raise InputContractError(
-            f"Prepared.tensor must be a torch.Tensor (got {type(x4d).__name__})"
-        )
-    if not torch.is_floating_point(x4d):
-        raise InputContractError(
-            f"Prepared.tensor must be floating-point (got dtype={x4d.dtype})"
-        )
-    if x4d.ndim != 4:
-        raise InputContractError(
-            f"Encoder-prepared tensor must be 4D [B*Z, C, S, S] (got ndim={x4d.ndim}, "
-            f"shape={tuple(x4d.shape)})"
-        )
-    BZ, C_in, Sy, Sx = x4d.shape
-    expected_c = _resolve_in_chans(backbone)
-    if C_in != expected_c:
-        raise InputContractError(
-            f"Prepared.tensor channel count {C_in} does not match in_chans={expected_c}"
-        )
-    if Sy != Sx or Sy <= 0 or Sy % patch_size != 0:
-        raise InputContractError(
-            f"Prepared.tensor XY must be square + multiple of patch_size={patch_size} "
-            f"(got {Sy}x{Sx})"
-        )
-    # B * Z must equal the leading batch dim — the encoder folds (B, Z) → B*Z
-    # in apply_input, so this disagrees only when the meta has been corrupted.
-    if int(prepared.B) * int(prepared.Z) != BZ:
-        raise InputContractError(
-            f"Prepared.B * Prepared.Z ({prepared.B} * {prepared.Z} = "
-            f"{prepared.B * prepared.Z}) does not match tensor leading dim {BZ}."
-        )
+    # --- fold (B, Z) → B*Z, synthesise the channel axis (gray → in_chans) -------
+    in_chans = _resolve_in_chans(backbone)
+    x4d = tensor.reshape(B * Z, 1, Y, X).repeat(1, in_chans, 1, 1)
 
     tokens = backbone.prepare_tokens_with_masks(x4d)
     inner: dict[int, torch.Tensor] = {}
     for i, blk in enumerate(backbone.blocks):
         tokens = blk(tokens)
+        # Record the tap BEFORE the callback: ``inner[i]`` is the raw post-block,
+        # pre-final-norm feature; a head adapter callback must not contaminate it.
         if i in chosen_blocks:
             inner[i] = tokens.clone()
         if use_callback:
@@ -449,15 +280,44 @@ def compute_features(
 
     x_norm = backbone.norm(tokens)
     n_reg = int(backbone.num_register_tokens)
+
     out: dict[str, Any] = {}
     if return_cls:
-        out["cls"] = x_norm[:, 0]
+        # [B*Z, D] → [B, Z, D].
+        out["cls"] = _unfold_bz(x_norm[:, 0], B=B, Z=Z, drop=drop)
     if return_patch:
         # Patch tokens follow cls + any register tokens (n_reg == 0 for emdinov1).
-        out["patch"] = x_norm[:, 1 + n_reg :]
+        # [B*Z, N, D] → [B, Z, N, D].
+        out["patch"] = _unfold_bz(x_norm[:, 1 + n_reg :], B=B, Z=Z, drop=drop)
     if chosen_blocks:
-        out["inner"] = inner
+        # [B*Z, T, D] → [B, Z, T, D] per tapped block.
+        out["inner"] = {i: _unfold_bz(t, B=B, Z=Z, drop=drop) for i, t in inner.items()}
     return out
+
+
+def _unfold_bz(t: torch.Tensor, *, B: int, Z: int, drop: frozenset[str]) -> torch.Tensor:
+    """Un-fold a ``[B*Z, …]`` feature to ``[B, Z, …]`` and apply ``squeeze``.
+
+    ``drop`` (from :func:`parse_squeeze`) names which of ``b`` / ``z`` to remove —
+    each only when singleton (else raise; a non-singleton drop would lose data).
+    """
+    t = t.reshape(B, Z, *t.shape[1:])
+    # Drop z first (dim 1) then b (dim 0) so the b index stays valid while squeezing.
+    if "z" in drop:
+        if Z != 1:
+            raise InputContractError(
+                f"squeeze='z' requires a singleton z (got Z={Z}); a non-singleton "
+                f"depth cannot be squeezed."
+            )
+        t = t.squeeze(1)
+    if "b" in drop:
+        if B != 1:
+            raise InputContractError(
+                f"squeeze='b' requires a singleton batch (got B={B}); a non-singleton "
+                f"batch cannot be squeezed."
+            )
+        t = t.squeeze(0)
+    return t
 
 
 # --------------------------------------------------------------------------------------
@@ -506,7 +366,7 @@ def _validate_blocks(blocks: Sequence[int] | None, *, depth: int) -> tuple[int, 
 
 
 # --------------------------------------------------------------------------------------
-# Input prep: axes fold + channel handling + normalisation + square/patch check.
+# Input prep: axes fold + normalisation + square/patch conform (channel-less).
 # --------------------------------------------------------------------------------------
 
 
@@ -545,7 +405,7 @@ def _parse_axes(axes: str) -> str:
             # gray0 contract: the encoder synthesises the backbone's
             # channel layout itself — caller-provided channel axes are rejected.
             raise InputContractError(
-                f"`axes` must not contain 'c' — EMEncoder.forward takes grayscale "
+                f"`axes` must not contain 'c' — the encoder takes grayscale "
                 f"input only (gray0); see docs/input-format.md (got axes={axes!r})."
             )
         if ax not in _AXES_VALID:
@@ -569,15 +429,14 @@ def _prepare_input(
     mean: float,
     std: float,
     patch_size: int,
-    in_chans: int,
-    norm: None | str | Mapping[str, float | Sequence[float]],
+    norm: None | str | Mapping[str, float],
     conform: str = "strict",
-) -> Prepared:
-    """Apply axes fold + channel synthesis + normalisation + XY conform → ``Prepared``.
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Axes fold + XY conform + scalar normalisation → ``(canonical, orig_yx)``.
 
-    Pipeline:
+    Pipeline (channel-less throughout):
 
-    1. Validate ``axes`` (gray0; ``c`` rejected) and verify ``x.ndim == len(axes)``.
+    1. Validate ``axes`` (gray0; ``c`` rejected) and ``x.ndim == len(axes)``.
     2. Reorder dims into the canonical ``b z y x`` order; insert size-1 dims for
        any axis the caller omitted (so the rest of the pipeline is shape-uniform).
     3. **Conform XY.** ``strict``: validate square + ``Y % patch_size == 0``,
@@ -585,15 +444,13 @@ def _prepare_input(
        ``patch_size`` (fold (B,Z)→B*Z for XY-only resize, then unfold). ``pad`` is
        **rejected** by the encoder (padding without restore would leave padded-region
        tokens in patch/inner).
-    4. **Synthesise the channel axis**: unsqueeze a length-1 ``C`` dim and
-       ``repeat`` it to ``in_chans``. The encoder *always* sees
-       ``[B, Z, in_chans, Y, X]`` (EM is grayscale — there is no channel knob).
-    5. Apply the ``norm`` directive (None → arch ``mean``/``std``;
-       ``'prenormalized'`` → skip; ``{'mean','std'}`` → override).
-    6. Fold (b, z) → leading ``b*z`` batch dim.
+    4. Apply the **scalar** ``norm`` directive (None → arch ``mean``/``std``;
+       ``'per-image'`` → per-sample z-score; ``'prenormalized'`` → skip;
+       ``{'mean','std'}`` → scalar override). Channel synthesis is a compute concern,
+       so the affine runs once on the channel-less grid (identical to per-channel
+       because every synthesised channel is a copy).
 
-    Returns a frozen :class:`Prepared` carrying the canonical 4D tensor plus
-    the metadata downstream consumers (compute, optional un-conform) need.
+    Returns ``(canonical[B, Z, Y, X], orig_yx)``.
     """
     axes_clean = _parse_axes(axes)
     if x.ndim != len(axes_clean):
@@ -615,10 +472,8 @@ def _prepare_input(
     B, Z, Y, X = x.shape
     orig_yx = (int(Y), int(X))
 
-    # Empty-axis guard — a zero-sized axis passes
-    # ``Y % patch_size == 0`` (strict) and reaches F.pad/interpolate (resize)
-    # where it surfaces a raw torch error. Reject at the wrapper with a clear
-    # message.
+    # Empty-axis guard — a zero-sized axis passes ``Y % patch_size == 0`` (strict)
+    # and reaches F.interpolate (resize) where it surfaces a raw torch error.
     if B <= 0 or Z <= 0 or Y <= 0 or X <= 0:
         raise InputContractError(
             f"EMEncoder.apply_input: empty axis (got B={B}, Z={Z}, Y={Y}, X={X}); "
@@ -639,7 +494,6 @@ def _prepare_input(
         _warn_tensor_out_of_unit_range(x, what="EMEncoder input")
 
     # --- (3) Conform XY --------------------------------------------------------
-    pad_or_scale: dict = {}
     if conform == "pad":
         # The encoder does not support pad (would pollute patch/inner with
         # padded-region tokens since there is no output restore step).
@@ -664,7 +518,6 @@ def _prepare_input(
         # Target square side: next multiple of patch_size that fits the larger of
         # (Y, X). Already-conforming input is a no-op (target == Y == X).
         target = _ceil_to_multiple(max(Y, X), patch_size)
-        pad_or_scale = {"target": int(target)}
         if (Y, X) != (target, target):
             # Bicubic interpolate XY only — fold (B, Z) → B*Z so the 4D interpolate
             # touches only the last two axes.
@@ -679,23 +532,18 @@ def _prepare_input(
             Y = X = target
     else:
         raise InputContractError(
-            f"conform must be one of 'pad', 'resize', 'strict' (got {conform!r})"
+            f"conform must be one of 'resize', 'strict' (got {conform!r}); the "
+            f"encoder rejects 'pad'."
         )
 
-    # --- (4) Channel synthesis (gray0 → in_chans) -------------------------------
-    x = x.unsqueeze(2).repeat(1, 1, in_chans, 1, 1)
-    C_in = in_chans
-
-    # --- (5) Normalisation: the ``norm`` directive ------------------------------
+    # --- (4) Scalar normalisation: the ``norm`` directive -----------------------
     if per_image:
-        # Per-sample z-score with the PRE-CONFORM stats (broadcast over B). Stats are
-        # float32 for stability; cast the RESULT back to x.dtype so a non-fp32 encoder
-        # (e.g. CUDA fp16) matches the fixed-affine path and the raw forward (which feeds
-        # this Prepared straight into the backbone with no re-cast) does not diverge from
-        # the split path.
+        # Per-sample z-score with the PRE-CONFORM stats (broadcast over B). Stats
+        # are float32 for stability; cast the RESULT back to x.dtype so a non-fp32
+        # encoder (CUDA fp16) matches the fixed-affine path.
         assert pi_mean is not None and pi_std is not None
-        m = pi_mean.to(device=x.device).view(B, 1, 1, 1, 1)
-        s = pi_std.to(device=x.device).view(B, 1, 1, 1, 1)
+        m = pi_mean.to(device=x.device).view(B, 1, 1, 1)
+        s = pi_std.to(device=x.device).view(B, 1, 1, 1)
         x = ((x - m) / s).to(x.dtype)
     else:
         eff_mean, eff_std = _resolve_norm(norm, mean, std)
@@ -703,21 +551,9 @@ def _prepare_input(
             if isinstance(norm, Mapping):  # argument-decide → warn on out-of-[0,1]
                 _warn_values_out_of_unit_range(eff_mean, what="norm mean")
                 _warn_values_out_of_unit_range(eff_std, what="norm std")
-            x = _apply_affine(x, eff_mean, eff_std, c=C_in)
+            x = _apply_scalar_affine(x, eff_mean, eff_std)
 
-    # --- (6) Fold (B, Z) → leading B*Z; drop the now-singleton Z dim ------------
-    # Shape goes from (B, Z, C, Y, X) → (B*Z, C, Y, X).
-    x = x.reshape(B * Z, C_in, Y, X)
-    return Prepared(
-        tensor=x,
-        axes=axes_clean,
-        conform=conform,  # type: ignore[arg-type]
-        orig_yx=orig_yx,
-        pad_or_scale=pad_or_scale,
-        B=int(B),
-        Z=int(Z),
-        stride=int(patch_size),
-    )
+    return x, orig_yx
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:
@@ -733,25 +569,25 @@ def _ceil_to_multiple(value: int, multiple: int) -> int:
 
 
 def _resolve_norm(
-    norm: None | str | Mapping[str, float | Sequence[float]],
+    norm: None | str | Mapping[str, float],
     mean: float,
     std: float,
-) -> tuple[float | Sequence[float] | None, float | Sequence[float] | None]:
-    """Resolve the ``norm=`` directive into effective ``(mean, std)``.
+) -> tuple[float | None, float | None]:
+    """Resolve the ``norm=`` directive into an effective **scalar** ``(mean, std)``.
 
     Returns ``(None, None)`` for ``'prenormalized'`` (caller signalling "skip the
-    affine"); otherwise a concrete ``(mean, std)`` pair to feed
-    :func:`_apply_affine`.
+    affine"); otherwise a concrete scalar ``(mean, std)`` pair.
 
     Accepted shapes:
 
     * ``None`` → the arch ``mean`` / ``std`` passed in;
     * ``'prenormalized'`` → ``(None, None)`` (skip);
-    * ``{'mean': m, 'std': s}`` → ``(m, s)`` — **both** keys required, neither
-      may itself be ``None``.
+    * ``{'mean': m, 'std': s}`` → ``(m, s)`` — **both** keys required, each a
+      finite scalar (per-channel sequences are rejected: EM is grayscale, the
+      synthesised channels are identical, so a per-channel override is meaningless).
 
-    Anything else (a callable, an unknown string, a partial / extra-key dict)
-    raises :class:`InputContractError`.
+    Anything else (a callable, an unknown string, a partial / extra-key dict, a
+    sequence ``mean`` / ``std``) raises :class:`InputContractError`.
     """
     if norm is None:
         return mean, std
@@ -759,9 +595,9 @@ def _resolve_norm(
         if norm == _PRENORMALIZED:
             return None, None
         raise InputContractError(
-            f"`norm` string must be {_PRENORMALIZED!r} (got {norm!r}); for a custom "
-            f"affine pass norm={{'mean': m, 'std': s}}, or normalise the input "
-            f"yourself and pass norm='{_PRENORMALIZED}'."
+            f"`norm` string must be {_PRENORMALIZED!r} or {_PER_IMAGE!r} (got {norm!r}); "
+            f"for a custom affine pass norm={{'mean': m, 'std': s}} (scalars), or "
+            f"normalise the input yourself and pass norm='{_PRENORMALIZED}'."
         )
     if isinstance(norm, Mapping):
         keys = set(norm)
@@ -777,73 +613,56 @@ def _resolve_norm(
             )
         return m, s
     raise InputContractError(
-        f"`norm` must be None, '{_PRENORMALIZED}', or a {{'mean','std'}} dict "
-        f"(got {type(norm).__name__}: {norm!r}). Callables are not accepted — "
-        f"normalise the input yourself and pass norm='{_PRENORMALIZED}'."
+        f"`norm` must be None, '{_PRENORMALIZED}', '{_PER_IMAGE}', or a "
+        f"{{'mean','std'}} dict (got {type(norm).__name__}: {norm!r}). Callables "
+        f"are not accepted — normalise the input yourself and pass "
+        f"norm='{_PRENORMALIZED}'."
     )
 
 
-def _apply_affine(
+def _apply_scalar_affine(
     x: torch.Tensor,
-    mean: float | Sequence[float],
-    std: float | Sequence[float],
-    *,
-    c: int,
+    mean: float,
+    std: float,
 ) -> torch.Tensor:
-    """Apply ``(x - mean) / std`` along the channel axis (dim=2 in our canonical form).
-
-    ``mean``/``std`` may be scalars or per-channel sequences of length ``c``. The
-    helper validates the per-channel length so a mismatched override surfaces here
-    rather than as a downstream broadcasting nightmare.
-    """
-    m_t = _to_param_tensor(mean, c=c, ref=x, name="mean")
-    s_t = _to_param_tensor(std, c=c, ref=x, name="std", positive=True)
-    # x shape is (B, Z, C, Y, X); broadcast mean/std as (1, 1, C, 1, 1).
+    """Apply scalar ``(x - mean) / std`` on the channel-less ``[B, Z, Y, X]`` grid."""
+    m_t = _to_scalar_tensor(mean, ref=x, name="mean")
+    s_t = _to_scalar_tensor(std, ref=x, name="std", positive=True)
     return (x - m_t) / s_t
 
 
-def _to_param_tensor(
-    value: float | Sequence[float],
+def _to_scalar_tensor(
+    value: float,
     *,
-    c: int,
     ref: torch.Tensor,
     name: str,
     positive: bool = False,
 ) -> torch.Tensor:
-    """Reshape + validate a scalar / per-channel mean-or-std into a broadcast tensor.
+    """Validate a **scalar** mean-or-std and return it as a 0-d broadcast tensor.
 
-    Validates finiteness (and strict positivity when ``positive`` — std must be > 0
-    so the affine never divides by zero / produces inf/nan). Rejects strings/bytes
-    and non-numeric sequences with a clean :class:`InputContractError` (the old
-    ``InputTransform`` Pydantic model used to guard this).
+    Rejects sequences (norm is scalar-only post-0.1.1), strings/bytes, bools, and
+    non-finite / non-positive (for ``std``) values.
     """
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, bool):
+        raise InputContractError(f"{name} must be numeric (got bool {value!r})")
+    if isinstance(value, (int, float)):
         f = float(value)
         if not math.isfinite(f):
             raise InputContractError(f"{name} must be finite (got {value!r})")
         if positive and f <= 0:
             raise InputContractError(f"{name} must be strictly positive (got {value!r})")
         return torch.tensor(f, dtype=ref.dtype, device=ref.device)
-    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, bytearray)):
-        try:
-            vec = [float(x) for x in value]
-        except (TypeError, ValueError) as e:
-            raise InputContractError(
-                f"{name} per-channel sequence must be numeric (got {value!r})"
-            ) from e
-        if len(vec) != c:
-            raise InputContractError(
-                f"{name} must be a scalar or length-{c} per-channel sequence (got len {len(vec)})"
-            )
-        if not all(math.isfinite(x) for x in vec):
-            raise InputContractError(f"{name} values must be finite (got {value!r})")
-        if positive and any(x <= 0 for x in vec):
-            raise InputContractError(f"{name} values must be strictly positive (got {value!r})")
-        # Shape (1, 1, C, 1, 1) so it broadcasts against (B, Z, C, Y, X).
-        return torch.tensor(vec, dtype=ref.dtype, device=ref.device).reshape(1, 1, c, 1, 1)
+    if isinstance(value, (str, bytes, bytearray)):
+        raise InputContractError(f"{name} must be a numeric scalar, not a string (got {value!r})")
+    if isinstance(value, Iterable):
+        raise InputContractError(
+            f"{name} must be a SCALAR (got a sequence {value!r}); per-channel "
+            f"mean/std is rejected — EM is grayscale, the synthesised channels are "
+            f"identical, so a per-channel affine is meaningless."
+        )
     raise InputContractError(
-        f"{name} must be a scalar or numeric per-channel sequence (got {type(value).__name__})"
+        f"{name} must be a numeric scalar (got {type(value).__name__})"
     )
 
 
-__all__ = ["apply_input_features", "compute_features", "forward_features"]
+__all__ = ["compute_encoder", "prepare_encoder_input"]

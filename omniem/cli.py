@@ -41,7 +41,7 @@ Pinned observable behavior:
   state_dict) or ``--backbone`` + ``--head`` (split files). Output is gated by
   ``config.task_type``: no ``task_type`` → writes
   float logits only; ``task_type`` set → writes the derived output via
-  :meth:`OmniEM.apply_output` (``image2image`` → uint image, channel collapsed;
+  :meth:`OmniEM.run` (``image2image`` → uint image, channel collapsed;
   ``image2label`` → int label map). ``--out-dtype`` picks ``uint8`` (default) /
   ``uint16``; ``--save-logits`` additionally writes the float logits beside the
   main store. There is **no ``--output`` flag** — the transform is decided by
@@ -74,7 +74,7 @@ from omniem.encoders.base import EMEncoder
 from omniem.encoders.registry import ARCH_REGISTRY, list_encoders
 from omniem.errors import OmniEMError, OmniEMWarning
 from omniem.models.base import OmniEM
-from omniem.models.registry import MODEL_ARCH_REGISTRY, list_models
+from omniem.models.registry import MODEL_ARCH_REGISTRY, list_models, model_arch_info
 
 # Exit codes used by the CLI (stdout=path; errors -> stderr, exit 2).
 #   * 0 — success
@@ -297,9 +297,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "--output-scale F resizes the input XY by F before inference (super-res; "
             "XY only, warns for 3D). "
             "Output is gated by config.task_type — no task_type → "
-            "writes float logits only; task_type set → writes the derived output "
-            "via model.apply_output (--out-dtype uint8|uint16; --save-logits also "
-            "writes the float logits to <store>.logits.npy)."
+            "writes float logits only; task_type set → writes the task output "
+            "(the config.task_type transform; --out-dtype uint8|uint16; "
+            "--save-logits also writes the float logits to <store>.logits.npy)."
         ),
         # Disable prefix matching so the removed --output is not
         # silently re-bound to --output-path via argparse abbreviation.
@@ -334,9 +334,29 @@ def _build_parser() -> argparse.ArgumentParser:
             "Loads split weights_split/head_*.pt files directly."
         ),
     )
+    p_i.add_argument(
+        "--axes",
+        default=None,
+        metavar="AXES",
+        help=(
+            "Declare the input layout, e.g. yx / zyx / cyx / czyx (chars from "
+            "{b,c,z,y,x}; y and x required). Default: inferred 2D=yx / 3D=zyx from "
+            "ndim. A 'c' axis is reduced to grayscale before the channel-less model "
+            "(squeeze if size-1, else requires --color-to-gray)."
+        ),
+    )
+    p_i.add_argument(
+        "--color-to-gray",
+        action="store_true",
+        dest="color_to_gray",
+        help=(
+            "Average a size>1 channel axis to grayscale before inference (the model "
+            "is channel-less). Without it, a multi-channel 'c' axis is an error."
+        ),
+    )
     _add_input_scale_norm_args(p_i)
     # --output is REMOVED. The output transform is decided by
-    # config.task_type (model.apply_output); --out-dtype + --save-logits are the
+    # config.task_type (the model's output stage); --out-dtype + --save-logits are the
     # only sub-knobs. argparse default is None so the runtime can distinguish
     # "user passed --out-dtype" from "unset" and reject the no-task_type case.
     p_i.add_argument(
@@ -848,7 +868,7 @@ def _run_features(ns: argparse.Namespace) -> int:
     # with --blocks by _check_inner_blocks). --blocks alone never writes inner.
     if "inner" in want:
         fwd_kwargs["return_blocks"] = list(blocks)
-    out = enc(image, **fwd_kwargs)
+    out = enc.run(image, **fwd_kwargs)
 
     # ---- write -----------------------------------------------------------------
     norm_record = _norm_record(norm_kind, norm, default_mean=enc.mean, default_std=enc.std)
@@ -1138,19 +1158,51 @@ def _run_infer(ns: argparse.Namespace) -> int:
 
     # ---- load image ------------------------------------------------------------
     img_np = _read_image(Path(ns.input))
-    if img_np.ndim == 2:
-        axes = "yx"
-    elif img_np.ndim == 3:
-        axes = "zyx"
+
+    # ---- axes resolution (source axes — the on-disk layout) -------------------
+    # --axes given → validate against the shape; omitted → infer 2D=yx / 3D=zyx.
+    if ns.axes is not None:
+        try:
+            source_axes = _resolve_explicit_axes(ns.axes, img_np.shape)
+        except OmniEMError as e:
+            print(f"omniem infer: {e}", file=sys.stderr)
+            return _EXIT_ERROR
     else:
-        print(
-            f"omniem infer: input ndim {img_np.ndim} not supported (expected 2D or 3D).",
-            file=sys.stderr,
+        if img_np.ndim == 2:
+            source_axes = "yx"
+        elif img_np.ndim == 3:
+            source_axes = "zyx"
+            if 3 in img_np.shape:
+                print(
+                    f"omniem infer: input has shape {img_np.shape} with a size-3 axis "
+                    f"and no --axes given; inferring 'zyx'. If this is RGB-stored "
+                    f"grayscale, pass --axes (e.g. cyx, czyx) to declare the layout.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"omniem infer: input ndim {img_np.ndim} not supported without --axes "
+                f"(expected 2D=yx or 3D=zyx). Pass --axes to declare the layout.",
+                file=sys.stderr,
+            )
+            return _EXIT_ERROR
+
+    # ---- channel reduction (source_axes → gray0 forward_axes) -----------------
+    # The model is channel-less; reduce any `c` axis to grayscale BEFORE the
+    # int→float scale (so scale sees one channel of data). Reduction decision uses
+    # the SOURCE dtype, not the post-mean float promotion.
+    source_dtype = img_np.dtype
+    try:
+        img_np, forward_axes, channel_reduction = _reduce_to_gray0(
+            img_np,
+            source_axes=source_axes,
+            color_to_gray=bool(ns.color_to_gray),
         )
+    except OmniEMError as e:
+        print(f"omniem infer: {e}", file=sys.stderr)
         return _EXIT_ERROR
 
     # ---- scale axis: input -> float [0,1] -------------------------------------
-    source_dtype = img_np.dtype
     img_np, scale_record = _resolve_scale(
         img_np,
         source_dtype=source_dtype,
@@ -1165,13 +1217,10 @@ def _run_infer(ns: argparse.Namespace) -> int:
 
     # ---- output policy gate (validate cheaply BEFORE any resize / forward) ----
     # task_type unset -> logits-float only; --dtype/--save-logits illegal.
-    # task_type set   -> derived transform via model.apply_output(dtype=); the
-    #                    CLI calls ONLY model.apply_output (drift guard).
+    # task_type set   -> task output (the config.task_type transform); --save-logits
+    #                    also writes the restored float logits.
     # These checks are cheap and run BEFORE the --output-scale resize + forward so
-    # a bad flag combo / existing logits sibling fails fast — a large --output-scale
-    # must not allocate / OOM ahead of a clean exit-2 error. The forward below uses
-    # the SPLIT path (apply_input → predict → apply_output) so the sidecar can
-    # record `conform` mode + original/conformed XY from the Prepared meta.
+    # a bad flag combo / existing logits sibling fails fast.
     conform = ns.conform
     task_type = model.config.task_type
     dtype_given = ns.out_dtype is not None
@@ -1221,15 +1270,19 @@ def _run_infer(ns: argparse.Namespace) -> int:
         import torch.nn.functional as F  # local import
 
         factor = float(ns.output_scale)
-        # axes is 'yx' (Y,X) or 'zyx' (Z,Y,X); XY are always the last two dims.
-        in_y, in_x = int(image.shape[-2]), int(image.shape[-1])
+        # Resize the Y and X axes by their ACTUAL positions in forward_axes — NOT a
+        # hard-coded last-two — so a permuted layout (e.g. --axes xy / yxz) resizes
+        # exactly Y,X (never Z) and records orig_yx in the right order.
+        y_ax = forward_axes.index("y")
+        x_ax = forward_axes.index("x")
+        in_y, in_x = int(image.shape[y_ax]), int(image.shape[x_ax])
         new_y, new_x = round(in_y * factor), round(in_x * factor)
         if new_y < 1 or new_x < 1:
             raise OmniEMError(
                 f"--output-scale {factor} shrinks XY ({in_y}x{in_x}) below 1 pixel "
                 f"({new_y}x{new_x}); choose a larger factor."
             )
-        if axes == "zyx":
+        if "z" in forward_axes:
             # XY-only resize on an anisotropic volume distorts in-plane spatial
             # information relative to Z, and no Z alignment / resampling is applied
             # (Z is left untouched). The "anisotropy" / "Z alignment" substrings are
@@ -1242,52 +1295,74 @@ def _run_infer(ns: argparse.Namespace) -> int:
                 OmniEMWarning,
                 stacklevel=2,
             )
-        # bicubic XY resize. 2D [Y,X] -> add fake batch+channel; 3D [Z,Y,X] -> Z is
-        # the batch dim (untouched), add a fake channel for per-slice XY resize.
-        if axes == "yx":
-            resized = F.interpolate(
-                image[None, None], size=(new_y, new_x), mode="bicubic", align_corners=False
-            )[0, 0]
-        else:  # zyx
-            resized = F.interpolate(
-                image[:, None], size=(new_y, new_x), mode="bicubic", align_corners=False
-            )[:, 0]
-        image = resized.contiguous()
+        # bicubic XY resize — move (Y, X) to the last two dims, fold the rest into one
+        # batch dim so the 4D interpolate touches ONLY Y,X, then restore the layout.
+        other = [i for i in range(image.ndim) if i not in (y_ax, x_ax)]
+        perm = other + [y_ax, x_ax]
+        inv = [0] * image.ndim
+        for new_pos, old in enumerate(perm):
+            inv[old] = new_pos
+        moved = image.permute(*perm)
+        lead = moved.shape[:-2]
+        flat = moved.reshape(-1, 1, in_y, in_x)
+        flat = F.interpolate(flat, size=(new_y, new_x), mode="bicubic", align_corners=False)
+        image = flat.reshape(*lead, new_y, new_x).permute(*inv).contiguous()
         output_scale_record = {
             "factor": factor,
             "input_yx": [in_y, in_x],
             "scaled_yx": [new_y, new_x],
         }
 
-    # ---- forward: single split path (apply_input -> predict -> apply_output) --
-    # Uses the SPLIT path so the sidecar can record `conform` mode + original XY +
-    # conformed XY from the Prepared meta. CLI passes axes='yx' / 'zyx' (no `b`),
-    # so `raw` is unbatched and apply_output derives ch_axis=0 from the same `axes`.
-    prepared = model.apply_input(image, axes=axes, norm=norm, conform=conform)
-    raw = model.predict(prepared)
+    # ---- forward: ONE canonical compute, derive task output + logits sibling --
+    # The unified pipeline is run via its internal stages here (not two public
+    # `run` calls) so `--save-logits` reuses the SAME forward for both the task
+    # output and the restored-logits sibling — one inference, never two.
+    canonical, fwd_orig_yx = model._apply_input(
+        image, axes=forward_axes, norm=norm, conform=conform
+    )
+    canon_logits = model.predict(canonical)  # single forward
+    logits_restored = None
     if task_type is None:
-        out_tensor = raw
+        # No task_type → the main output IS the restored float logits.
+        out_tensor = model._restore(
+            canon_logits, axes=forward_axes, orig_yx=fwd_orig_yx, conform=conform
+        )
     else:
-        out_tensor = model.apply_output(raw, axes=axes, dtype=applied_dtype)
+        out_tensor = model._apply_output(
+            canon_logits, axes=forward_axes, orig_yx=fwd_orig_yx,
+            conform=conform, squeeze="", dtype=applied_dtype,
+        )
+        if logits_path is not None:
+            logits_restored = model._restore(
+                canon_logits, axes=forward_axes, orig_yx=fwd_orig_yx, conform=conform
+            )
 
     # ---- write ----------------------------------------------------------------
     _write_predict_store(out_tensor, out_path, derived_transform=derived_transform)
     if logits_path is not None:
         logits_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(logits_path, raw.detach().cpu().numpy())
-    # Report the conform mode + original/conformed XY
-    # from the Prepared tensor directly. Reading the prepared tensor's XY shape
-    # avoids re-encoding conform knowledge in the CLI (a future conform mode
-    # that produces a non-square conformed shape would not be silently
-    # misreported here).
-    orig_yx = list(prepared.orig_yx)
-    # The model's canonical layout is [B, C, Y, X, Z]; read shape[2:4] directly.
-    conformed_yx = [int(prepared.tensor.shape[2]), int(prepared.tensor.shape[3])]
+        np.save(logits_path, logits_restored.detach().cpu().numpy())
+    # Conform round-trip record for the sidecar. orig_yx is the (post-output-scale)
+    # pre-conform XY, read by the ACTUAL y/x positions in forward_axes (so a permuted
+    # layout records Y,X in the right order); conformed_yx is the square the net saw
+    # (== orig under 'strict'; the next stride-multiple under pad/resize).
+    fwd_y = int(image.shape[forward_axes.index("y")])
+    fwd_x = int(image.shape[forward_axes.index("x")])
+    orig_yx = [fwd_y, fwd_x]
+    if conform == "strict":
+        conformed_yx = [fwd_y, fwd_x]
+    else:
+        stride = int(model_arch_info(model.config.arch).stride)
+        side = ((max(fwd_y, fwd_x) + stride - 1) // stride) * stride
+        conformed_yx = [side, side]
     _write_infer_sidecar(
         sidecar_path,
         model=model,
         input_path=Path(ns.input),
-        axes=axes,
+        source_axes=source_axes,
+        forward_axes=forward_axes,
+        channel_reduction=channel_reduction,
+        color_to_gray=bool(ns.color_to_gray),
         scale_record=scale_record,
         norm_record=_norm_record(norm_kind, norm, default_mean=model.mean, default_std=model.std),
         load_mode="merged" if merged_given else "split",
@@ -1320,12 +1395,13 @@ def _write_predict_store(
     Suffix routing: ``.tif`` / ``.tiff`` → tifffile; ``.npy`` → numpy.save;
     ``.npz`` → numpy.savez.
 
-    Shape contract: ``predict`` returns the tensor in caller-axes order — the
-    CLI uses ``axes='yx'`` / ``'zyx'``. ``model.apply_output`` collapses the
-    channel axis for both task types (image2image squeeze C=1; image2label
-    argmax), so ``[Y, X]`` / ``[Z, Y, X]`` lands here for the canonical output;
-    when ``derived_transform is None`` the tensor is logits with a leading C
-    axis (``[C, Y, X]`` / ``[C, Z, Y, X]``).
+    Shape contract: ``out`` is the caller-axes tensor the infer pipeline produced
+    for the forward axes (``'yx'`` / ``'zyx'`` for an un-batched 2D / 3D input).
+    When ``config.task_type`` is set it is the task output, with the channel axis
+    collapsed (``image2image`` squeeze C=1; ``image2label`` argmax), so ``[Y, X]`` /
+    ``[Z, Y, X]`` lands here. When ``derived_transform is None`` (no ``task_type``)
+    it is the restored float logits, with a leading ``C`` axis (``[C, Y, X]`` /
+    ``[C, Z, Y, X]``).
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     arr = out.detach().cpu().numpy()
@@ -1347,7 +1423,10 @@ def _write_infer_sidecar(
     *,
     model: OmniEM,
     input_path: Path,
-    axes: str,
+    source_axes: str,
+    forward_axes: str,
+    channel_reduction: str,
+    color_to_gray: bool,
     scale_record: dict[str, Any],
     norm_record: dict[str, Any],
     load_mode: str,
@@ -1388,7 +1467,13 @@ def _write_infer_sidecar(
         "schema_version": "1.0",
         "store": store_path.name,
         "input": str(input_path),
-        "axes": axes,
+        # Channel-less axes bookkeeping (mirrors `features`): the on-disk
+        # `source_axes`, the channel-reduced `forward_axes` fed to the model, the
+        # `channel_reduction` taken (none/squeeze/pick/mean), and the --color-to-gray flag.
+        "source_axes": source_axes,
+        "forward_axes": forward_axes,
+        "channel_reduction": channel_reduction,
+        "color_to_gray": bool(color_to_gray),
         # Explicit task/output fields (replace the old `output` flag).
         "task_type": task_type,
         "transform": derived_transform,

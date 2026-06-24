@@ -69,7 +69,7 @@ def _build_omniemv1(config, *, encoder=None) -> OmniEMV1Net:  # noqa: ANN001 —
     The factory wires the UNETR head per the config's per-head shape: ``img_z`` /
     ``kernel3d_z`` (decides 2D vs 3D + z-kernel), ``out_channels`` (decoder out),
     ``resize4emdino`` (the resize-to-encoder-grid flag). The model returns pure
-    logits — activation is owned by :meth:`OmniEM.apply_output`, not the net.
+    logits — activation is owned by :meth:`OmniEM.run` (output stage), not the net.
 
     The backbone is either **injected** via ``encoder`` (the shared-encoder borrow
     path — the caller already built it, e.g. ``EMEncoder.vit``) or built fresh from

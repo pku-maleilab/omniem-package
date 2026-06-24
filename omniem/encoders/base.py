@@ -17,21 +17,27 @@ checkpoint, loaded directly — no re-export).
 Usage:
 
     enc = EMEncoder.load("emdinov1", "weights/emdino_v3_best_250703.pth")
-    out = enc(x, axes="yx")                       # -> {"cls": [1, 1024]}
+    out = enc.run(x, axes="yx")                   # -> {"cls": [1, 1, 1024]}
 
-Public surface:
+Public surface (0.1.1 — channel-less, two-tier):
 
     EMEncoder.load(arch, weights, *, device=None, dtype=None)
-    enc.forward(x, *, axes, return_cls=True, return_patch=False,
-                return_blocks=None, block_callback=None, norm=None)
+    enc.run(image, *, axes, norm=None, conform="strict", squeeze="",
+            return_cls=True, return_patch=False, return_blocks=None,
+            block_callback=None)                  # raw image -> feature dict
+    enc.forward(tensor, *, return_cls=True, return_patch=False,
+                return_blocks=None, block_callback=None, squeeze="")
+                                                  # canonical [b, z, y, x] -> dict
     enc.arch             # str
     enc.mean, enc.std    # float — the arch's pretraining normalisation
     enc.device           # torch.device
     enc.dtype            # torch.dtype
     enc.embed_dim        # int
 
-``x`` must be **grayscale** (gray0) — ``axes`` may not contain ``c``; the encoder
-synthesises the backbone's channel layout itself. See ``docs/input-format.md``.
+``image`` / ``tensor`` must be **grayscale** (gray0) — ``axes`` may not contain
+``c``; the encoder synthesises the backbone's channel layout itself. The canonical
+compute layout is ``[b, z, y, x]`` (``z=1`` for a 2D tile). See
+``docs/input-format.md``.
 
 The ``norm=`` argument takes one of four shapes:
 ``None`` → use the arch ``mean`` / ``std``; ``'per-image'`` → per-sample z-score
@@ -53,12 +59,11 @@ import torch.nn as nn
 
 from omniem.encoders.dinov2.build import build
 from omniem.encoders.dinov2.forward import (
-    apply_input_features,
-    compute_features,
+    compute_encoder,
+    prepare_encoder_input,
 )
 from omniem.encoders.registry import arch_info, arch_mean_std
 from omniem.errors import InputContractError, WeightFormatError
-from omniem.prepared import Prepared
 
 # Public ``ArrayLike`` — the input to ``EMEncoder.forward`` / ``OmniEM.predict``.
 # Float arrays only; integer arrays must be scaled by the caller (uint8 != ÷255).
@@ -187,202 +192,183 @@ class EMEncoder(nn.Module):
             )
         return next(iter(groups))
 
-    # ---- forward -------------------------------------------------------------------
+    # ---- run (merged one-step: prep → compute) -----------------------------------
 
-    # ---- apply_input --------------------------------------------------------------
-
-    def apply_input(
+    def run(
         self,
-        x: ArrayLike,
+        image: ArrayLike,
         *,
         axes: str,
-        norm: None | str | Mapping[str, float | Sequence[float]] = None,
-        conform: str = "resize",
-    ) -> Prepared:
-        """Run only the input-transform stage; return a :class:`Prepared` carrier.
-
-        The split-out front half of :meth:`forward` — axes fold + gray0 →
-        ``in_chans`` synthesis + mean/std affine + XY conform. The wrapper-level
-        validation (fp16-CPU, int-dtype, ndarray→tensor) is owned by this method;
-        :meth:`forward` delegates here on raw input. Unlike the model-side
-        :meth:`OmniEM.apply_input`, this moves the input onto
-        ``self.device``/``self.dtype`` (a CUDA encoder yields a CUDA
-        ``Prepared.tensor``).
-
-        Args:
-            x: Raw grayscale input — a float :class:`torch.Tensor` or
-                :class:`numpy.ndarray`. ``axes`` may not contain ``c`` (the
-                encoder synthesises the backbone's channels). Integer dtypes are
-                rejected.
-            axes: One-character-per-axis string from ``{b,z,y,x}`` describing
-                ``x``.
-            norm: ``None`` → arch ``mean``/``std``; ``'per-image'`` → per-sample
-                z-score; ``'prenormalized'`` → skip the affine; ``{'mean': m,
-                'std': s}`` → override. Out-of-``[0,1]`` mean/std or scaled input →
-                warn-only :class:`~omniem.errors.OmniEMWarning`.
-            conform: ``'resize'`` (default — bicubic XY-only interpolate to the
-                next square multiple of the encoder's patch stride) or
-                ``'strict'`` (reject non-square / non-stride-multiple XY).
-                ``'pad'`` is not supported here.
-
-        Returns:
-            A frozen :class:`~omniem.prepared.Prepared` carrying the canonical
-            ``[B*Z, in_chans, S, S]`` tensor plus the metadata downstream
-            consumers need (``axes``, ``conform``, ``orig_yx``, ``pad_or_scale``,
-            ``B``, ``Z``, ``stride``).
-
-        Raises:
-            InputContractError: fp16-on-CPU; a non-float / wrong-type input; or an
-                axes string that does not match ``x``.
-        """
-        # fp16 CPU guard — apply_input owns the wrapper
-        # validation; the standalone-encoder split path otherwise
-        # surfaces a kernel error inside the backbone.
-        if self.dtype == torch.float16 and self.device.type == "cpu":
-            raise InputContractError(
-                "Encoder is float16 on CPU — most CPU conv kernels do not support fp16. "
-                "Move the encoder to a CUDA device, or use float32 on CPU."
-            )
-        x = self._coerce_input(x)
-        return apply_input_features(
-            self._backbone,
-            x,
-            axes=axes,
-            mean=self._mean,
-            std=self._std,
-            norm=norm,
-            conform=conform,
-        )
-
-    # ---- forward -------------------------------------------------------------------
-
-    def forward(  # type: ignore[override]
-        self,
-        x: ArrayLike | Prepared,
-        *,
-        axes: str | None = None,
+        norm: None | str | Mapping[str, float] = None,
+        conform: str = "strict",
+        squeeze: str = "",
         return_cls: bool = True,
         return_patch: bool = False,
         return_blocks: Sequence[int] | None = None,
         block_callback: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
-        norm: None | str | Mapping[str, float | Sequence[float]] = None,
-        conform: str = "strict",
     ) -> dict[str, Any]:
-        """Run the omniem-driven forward pass.
+        """Run the full encoder pipeline from a raw image — the everyday path.
 
-        ``x`` may be a raw :class:`torch.Tensor`/ndarray OR a
-        :class:`Prepared` returned by :meth:`apply_input`. The type is the
-        signal — no ``prepared=`` flag. When ``x`` is a ``Prepared``,
-        ``axes`` / ``norm`` / ``conform`` MUST be omitted / left at defaults
-        (they are baked into the meta) — passing non-defaults raises.
+        ``run`` = ``_apply_input → forward`` with the prep stage threaded
+        internally, so a mismatch is impossible. The input is **channel-less**
+        grayscale; ``axes`` may not contain ``c`` (the encoder synthesises the
+        backbone's channels itself).
 
-        ``conform`` defaults to ``'strict'`` here (preserves the reject-on-non-
-        conforming-XY behaviour on
-        raw input — a non-conforming XY raises). :meth:`apply_input` defaults to
-        ``'resize'`` instead because callers that reach for the split path are
-        the ones who want the round-trip.
+        Args:
+            image: Raw grayscale input — a float :class:`torch.Tensor` or
+                :class:`numpy.ndarray` (integer dtypes rejected; the caller scales
+                int→float).
+            axes: One-character-per-axis string from ``{b, z, y, x}`` describing
+                ``image`` (whitespace ignored; a ``c`` axis raises).
+            norm: ``None`` → arch ``mean``/``std``; ``'per-image'`` → per-sample
+                z-score; ``'prenormalized'`` → skip the affine; ``{'mean': m,
+                'std': s}`` → **scalar** override (per-channel sequences rejected).
+            conform: ``'strict'`` (default — reject non-square /
+                non-stride-multiple XY) or ``'resize'`` (bicubic XY-only resize to
+                the next square multiple of the patch stride). ``'pad'`` is rejected.
+            squeeze: A subset of ``{b, z}`` — drop the named axis from the feature
+                output **iff** singleton (else raise). Default ``""`` keeps the full
+                ``[B, Z, …]`` shape.
+            return_cls / return_patch / return_blocks / block_callback: forwarded
+                to :meth:`forward` (the compute stage).
 
-        Raw-input contract (unchanged):
-        * ``x`` may be a :class:`torch.Tensor` OR a :class:`numpy.ndarray`.
-        * Integer inputs are rejected (uint8 != ÷255).
-        * ``x`` must be **grayscale** (gray0) — ``axes`` may not contain ``c``.
-        * ``axes`` is required; ``norm`` / ``conform`` follow
-          :meth:`apply_input`.
+        Returns:
+            The feature dict (``cls`` / ``patch`` / ``inner``). Encoder features
+            have no spatial XY to mirror, so the shape follows ``[B, Z, …]`` (after
+            ``squeeze``) regardless of ``axes``.
+        """
+        tensor, _orig_yx = self._apply_input(image, axes=axes, norm=norm, conform=conform)
+        return self.forward(
+            tensor,
+            return_cls=return_cls,
+            return_patch=return_patch,
+            return_blocks=return_blocks,
+            block_callback=block_callback,
+            squeeze=squeeze,
+        )
 
-        Return-flag contract: ``return_cls`` / ``return_patch`` are independent
-        booleans; ``return_blocks=[i, j, …]`` both requests and selects the inner
-        taps. All-false → :class:`InputContractError`.
+    # ---- internal prep stage ------------------------------------------------------
 
-        Device/dtype: input auto-moved to ``self.device`` + auto-cast to
-        ``self.dtype``. No silent half on CPU.
+    def _apply_input(
+        self,
+        image: ArrayLike,
+        *,
+        axes: str,
+        norm: None | str | Mapping[str, float] = None,
+        conform: str = "strict",
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        """Internal prep stage — return ``(canonical[b, z, y, x], orig_yx)``.
+
+        Owns the wrapper-level validation (fp16-CPU, int-dtype, ndarray→tensor,
+        device/dtype move) then delegates to
+        :func:`omniem.encoders.dinov2.forward.prepare_encoder_input`. The returned
+        tensor is channel-less and normalised; channel synthesis + ``B*Z`` fold are
+        compute concerns (:meth:`forward`). Not public — :meth:`run` threads it.
         """
         if self.dtype == torch.float16 and self.device.type == "cpu":
             raise InputContractError(
                 "Encoder is float16 on CPU — most CPU conv kernels do not support fp16. "
                 "Move the encoder to a CUDA device, or use float32 on CPU."
             )
-
-        if isinstance(x, Prepared):
-            # Prepared-mode: axes / norm / conform are baked in — reject overrides.
-            if axes is not None:
-                raise InputContractError(
-                    "EMEncoder.forward: `axes` must be omitted when x is a Prepared "
-                    "(axes is already baked into Prepared.axes)."
-                )
-            if norm is not None:
-                raise InputContractError(
-                    "EMEncoder.forward: `norm` must be omitted when x is a Prepared "
-                    "(the affine was already applied during apply_input)."
-                )
-            if conform != "strict":
-                # ``conform`` has a default, but a caller passing a non-default
-                # value alongside a Prepared is almost certainly confused — flag
-                # it so they don't think it changes anything. (Default is
-                # ``'strict'`` here for raw-input back-compat; the Prepared
-                # already carries its own ``conform`` in the meta.)
-                raise InputContractError(
-                    "EMEncoder.forward: `conform` must be omitted when x is a Prepared "
-                    "(the conform was already applied during apply_input)."
-                )
-            # Coerce the Prepared tensor onto the encoder's device/dtype before
-            # the backbone forward. Without this a CPU/double
-            # Prepared fed to a CUDA/float32 encoder would surface a baffling
-            # internal torch error instead of the wrapper's "auto-moved" promise.
-            if x.tensor.device != self.device or x.tensor.dtype != self.dtype:
-                # Prepared is frozen, so rebuild it with the moved tensor.
-                x = Prepared(
-                    tensor=x.tensor.to(device=self.device, dtype=self.dtype),
-                    axes=x.axes,
-                    conform=x.conform,
-                    orig_yx=x.orig_yx,
-                    pad_or_scale=x.pad_or_scale,
-                    B=x.B,
-                    Z=x.Z,
-                    stride=x.stride,
-                )
-            return compute_features(
-                self._backbone,
-                x,
-                return_cls=return_cls,
-                return_patch=return_patch,
-                return_blocks=return_blocks,
-                block_callback=block_callback,
-            )
-
-        # Raw-input path: axes is required.
-        if axes is None:
-            raise InputContractError(
-                "EMEncoder.forward: `axes` is required for raw input (pass a "
-                "Prepared via x= to skip; see apply_input)."
-            )
-        x = self._coerce_input(x)
-        prepared = apply_input_features(
+        image = self._coerce_input(image)
+        return prepare_encoder_input(
             self._backbone,
-            x,
+            image,
             axes=axes,
             mean=self._mean,
             std=self._std,
             norm=norm,
             conform=conform,
         )
-        return compute_features(
+
+    # ---- forward (canonical compute) ---------------------------------------------
+
+    def forward(  # type: ignore[override]
+        self,
+        tensor: torch.Tensor,
+        *,
+        return_cls: bool = True,
+        return_patch: bool = False,
+        return_blocks: Sequence[int] | None = None,
+        block_callback: Callable[[int, torch.Tensor], torch.Tensor] | None = None,
+        squeeze: str = "",
+        axes: str | None = None,
+        norm: Any = None,
+        conform: Any = None,
+    ) -> dict[str, Any]:
+        """Compute encoder features from a **canonical** ``[b, z, y, x]`` tensor.
+
+        The power path: ``tensor`` is a pre-built canonical, channel-less,
+        **already-normalised** float tensor (``z=1`` for a 2D tile). ``forward``
+        validates the shape strictly (no normalization inferred), folds ``B*Z``,
+        synthesises the channel axis, runs the blocks, un-folds to ``[B, Z, …]``,
+        and applies ``squeeze``. For raw images use :meth:`run`.
+
+        Args:
+            tensor: Canonical ``[b, z, y, x]`` float tensor — integer tensors raise
+                (the package never scales int→float). Auto-moved/cast to the
+                encoder's device/dtype.
+            return_cls / return_patch / return_blocks / block_callback: the
+                return-flag contract (independent bools; ``return_blocks=[i, …]``
+                both requests and selects the taps; all-false raises). The
+                ``block_callback`` sees the folded ``[B*Z, tokens, dim]``.
+            squeeze: A subset of ``{b, z}`` — drop the named singleton axis.
+            axes / norm / conform: **Removed in 0.1.1.** Present only to detect the
+                old ``forward(raw, axes=…, norm=…, conform=…)`` one-shot call and
+                raise a clear migration error rather than a cryptic ``TypeError``.
+
+        Returns:
+            ``{cls [B, Z, D]?, patch [B, Z, N, D]?, inner {i: [B, Z, T, D]}?}``
+            (after ``squeeze``).
+        """
+        if axes is not None or norm is not None or conform is not None:
+            raise InputContractError(
+                "EMEncoder.forward(x, axes=…/norm=…/conform=…) was removed in 0.1.1. "
+                "`forward` now takes only a canonical [b, z, y, x] tensor. Use "
+                "`enc.run(image, axes=…, norm=…, conform=…)` for a raw image, or build "
+                "the canonical tensor and call `enc.forward(canonical)`."
+            )
+        if self.dtype == torch.float16 and self.device.type == "cpu":
+            raise InputContractError(
+                "Encoder is float16 on CPU — most CPU conv kernels do not support fp16. "
+                "Move the encoder to a CUDA device, or use float32 on CPU."
+            )
+        if not isinstance(tensor, torch.Tensor):
+            raise InputContractError(
+                f"EMEncoder.forward expects a canonical [b, z, y, x] torch.Tensor "
+                f"(got {type(tensor).__name__}); use run(image, axes=…) for raw input."
+            )
+        # Auto-move/cast the float tensor onto the encoder (compute validates int).
+        if tensor.is_floating_point() and (
+            tensor.device != self.device or tensor.dtype != self.dtype
+        ):
+            tensor = tensor.to(device=self.device, dtype=self.dtype)
+        return compute_encoder(
             self._backbone,
-            prepared,
+            tensor,
             return_cls=return_cls,
             return_patch=return_patch,
             return_blocks=return_blocks,
             block_callback=block_callback,
+            squeeze=squeeze,
         )
 
-    # ---- wrapper-level coercion (owned by apply_input + forward) ------------------
+    # ---- migration stub (removed public surface) ---------------------------------
+
+    def apply_input(self, *args: Any, **kwargs: Any):
+        """Removed in 0.1.1 — use :meth:`run` / build a canonical for :meth:`forward`."""
+        raise InputContractError(
+            "EMEncoder.apply_input was removed in 0.1.1 (no more Prepared carrier). "
+            "Use `enc.run(image, axes=…)` for the full pipeline, or build a "
+            "canonical [b, z, y, x] tensor and call `enc.forward(canonical)`."
+        )
+
+    # ---- wrapper-level coercion (owned by _apply_input) --------------------------
 
     def _coerce_input(self, x: ArrayLike) -> torch.Tensor:
         """Reject int dtypes / wrong types and move to self.device/self.dtype.
 
-        Pulled out of the old ``forward`` body so :meth:`apply_input` and the
-        raw-input branch of :meth:`forward` share exactly one validator
-        (the prep owns its validation; nothing is left behind when the split
-        happens).
+        Shared by :meth:`_apply_input`; the prep owns its validation.
         """
         if isinstance(x, np.ndarray):
             if not np.issubdtype(x.dtype, np.floating):

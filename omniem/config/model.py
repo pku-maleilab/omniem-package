@@ -3,9 +3,9 @@
 A ``ModelConfig`` is the user-owned recipe to build an :class:`omniem.models.OmniEM`
 and to validate inputs at :meth:`OmniEM.predict` time.
 
-The model returns pure logits; the activation is a property of ``task_type`` /
-``model.apply_output``, not the model forward (there is no ``output_nonlinear``
-field).
+The model returns pure logits; the activation is a property of ``task_type``,
+applied by :meth:`OmniEM.run` (its internal output stage), not the model forward
+(there is no ``output_nonlinear`` field).
 
 * **`task_type`** (optional, ``Literal['image2image','image2label'] | None``).
   When set, it derives/validates the output side: ``image2image`` derives
@@ -53,7 +53,7 @@ class ModelConfig(BaseConfig):
             must be ``None``. ``img_z>1`` → ``None`` (treated as 1) or a
             positive ODD int (3 for the mito-3D head).
         task_type: ``"image2image"`` (denoise/super-res →
-            sigmoid+uint output via :meth:`OmniEM.apply_output`), ``"image2label"``
+            sigmoid+uint output via :meth:`OmniEM.run`), ``"image2label"``
             (segmentation → argmax output), or ``None`` (model has no opinion;
             the caller postprocesses the raw logits themselves). The activation
             is **derived** from this — there is no `output_nonlinear` config field.

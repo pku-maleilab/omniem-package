@@ -66,7 +66,7 @@ class OmniEMV1Net(nn.Module):
 
     The model returns **pure logits** — there is no in-model
     output nonlinearity. Activation is a property of ``config.task_type`` and
-    is applied by :meth:`OmniEM.apply_output` (the model-owned output stage).
+    is applied by :meth:`OmniEM.run` (the model-owned output stage).
     """
 
     def __init__(
@@ -227,8 +227,8 @@ class OmniEMV1Net(nn.Module):
 
         # The model returns PURE LOGITS. The in-model
         # ``output_nonlinear`` is REMOVED; activation is a property of
-        # ``config.task_type`` applied by :meth:`OmniEM.apply_output` (the
-        # output stage), never inside the model forward.
+        # ``config.task_type`` applied by :meth:`OmniEM.run` (the output
+        # stage), never inside the model forward.
 
         # Derive the encoder's state_dict prefix from the child module that holds
         # it, BY IDENTITY — so backbone-vs-head partitioning (split save/load,
@@ -373,7 +373,7 @@ class OmniEMV1Net(nn.Module):
         out = self.decoder2(dec1, enc1)
         logits = self.out(out)
         # Pure logits — no in-model activation.
-        # Activation moved to OmniEM.apply_output (model-owned, task_type-gated).
+        # Activation moved to OmniEM.run output stage (model-owned, task_type-gated).
         return logits
 
 

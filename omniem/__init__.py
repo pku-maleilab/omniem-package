@@ -31,7 +31,7 @@ Stage 2) and are guarded at use time via
 # Single source of truth for the package version. Kept as a plain string so importing
 # omniem never requires importlib.metadata / an installed distribution, and so that
 # hatchling can extract it via path-regex without ever importing the package.
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 from omniem.encoders import EMEncoder

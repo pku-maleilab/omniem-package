@@ -1,9 +1,9 @@
 """Internal output-stage transforms.
 
-The output stage is owned by the model (:meth:`omniem.models.base.OmniEM.apply_output`),
-gated by ``config.task_type``. The math lives here as **internal** helpers so the
-model method and the CLI share one implementation (drift guard). There is no
-public free function in this module — a standalone
+The output stage is owned by the model — :meth:`OmniEM.run` (its internal
+``_apply_output``), gated by ``config.task_type``. The math lives here as
+**internal** helpers so the model and the CLI share one implementation (drift
+guard). There is no public free function in this module — a standalone
 ``apply_output(out_channels=, output=)`` would be a footgun.
 
 Two transforms:

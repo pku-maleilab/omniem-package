@@ -1,11 +1,13 @@
 """``OmniEM`` — the user-facing model wrapper.
 
-Public surface:
+Public surface (0.1.1 — channel-less, two-tier):
 
     OmniEM.load(config, weights=None, *, backbone=None, head=None,
                 device=None, dtype=None) -> OmniEM
     OmniEM.from_config(config) -> OmniEM                 # random init, test path
-    model.predict(x, *, axes, norm=None) -> torch.Tensor # RAW model output
+    model.run(image, *, axes, norm=None, conform="strict", squeeze="",
+              dtype=None, return_logits=False) -> torch.Tensor   # raw image -> output
+    model.predict(tensor) -> torch.Tensor               # canonical [b,z,y,x] -> logits
     model.save_weights(path=None, *, backbone=None, head=None) -> Path | (Path, Path)
     model.config, model.device, model.dtype, model.mean, model.std
 
@@ -13,16 +15,26 @@ There is NO bundle, NO meta, NO key rename, NO tag. The model is built from the
 user's :class:`ModelConfig` (the recipe) + raw weights file(s); the only check at
 load is :meth:`torch.nn.Module.load_state_dict` ``strict=True``.
 
+Two tiers:
+
+* :meth:`run` — the everyday, safe path: prep → compute → recover from a raw image
+  in one call, threading every recovery arg internally (no mismatch possible).
+  ``return_logits=False`` gives the task output (needs ``config.task_type``);
+  ``return_logits=True`` gives restored caller-layout FLOAT logits.
+* :meth:`predict` — the power path: pure compute on a **canonical** ``[b, z, y, x]``
+  (ZYX, channel-less, ``z == img_z``) float tensor → canonical logits
+  ``[b, c_out, z, y, x]`` (no recovery). Integer tensors raise.
+
 Internals:
 
 * ``self._net`` is the :class:`OmniEMV1Net` (encoder + STAdapter
   z-fusion + UNETR decoder). The backbone lives at ``self._net.vit``.
-* :meth:`predict` returns the raw model output (post the in-model
-  ``output_nonlinear``, removed) — the output stage is the
-  model method :meth:`OmniEM.apply_output`, gated by ``config.task_type``.
-* Normalisation is owned by the MODEL: ``norm=None`` resolves
-  to ``config.mean`` / ``config.std`` (the FIXED training norm — the head's own
-  training statistics, NOT arch-derived, NOT per-image).
+* The prep / recover stages — ``_apply_input`` (raw → canonical + ``orig_yx``),
+  ``_restore`` (logits → caller layout), ``_apply_output`` (task transform) — are
+  internal; ``run`` is built from them.
+* Normalisation is owned by the MODEL prep: ``norm=None`` resolves to
+  ``config.mean`` / ``config.std`` (the FIXED training norm — the head's own
+  training statistics, NOT arch-derived, NOT per-image). It is **scalar**.
 """
 
 from __future__ import annotations
@@ -37,6 +49,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from omniem._pipeline import channel_insert, parse_squeeze
 from omniem.config.model import ModelConfig
 from omniem.encoders.base import EMEncoder
 from omniem.encoders.dinov2.forward import (
@@ -49,12 +62,13 @@ from omniem.encoders.dinov2.forward import (
 from omniem.errors import ConfigError, InputContractError, WeightFormatError
 from omniem.models.omniemv1_net import OmniEMV1Net
 from omniem.models.registry import model_arch_info
-from omniem.prepared import Prepared, channel_axis_from_axes
 
 ArrayLike = torch.Tensor | np.ndarray
 
-# Valid axes characters for ``predict``. Same alphabet as :meth:`EMEncoder.forward`.
-_AXES_VALID: frozenset[str] = frozenset({"b", "c", "z", "y", "x"})
+# Valid axes characters — **channel-less** (EM is grayscale; ``in_chans`` is a
+# model-internal detail). A ``c`` axis raises (declaring an RGB-stored layout is a
+# CLI-only concern: ``--axes cyx`` + ``--color-to-gray`` reduce it *before* the API).
+_AXES_VALID: frozenset[str] = frozenset({"b", "z", "y", "x"})
 
 class OmniEM(nn.Module):
     """Inference-only OmniEM model (encoder + STAdapter + UNETR decoder).
@@ -545,281 +559,387 @@ class OmniEM(nn.Module):
         torch.save(head_dict, head_path)
         return bb_path, head_path
 
-    # ---- apply_input + predict ----------------------------------------------------
+    # ---- run (merged one-step: prep → compute → recover) -------------------------
 
-    def apply_input(
+    def run(
         self,
-        x: ArrayLike,
+        image: ArrayLike,
         *,
         axes: str,
-        norm: None | str | Mapping[str, float | Sequence[float]] = None,
+        norm: None | str | Mapping[str, float] = None,
         conform: str = "strict",
-    ) -> Prepared:
-        """Run only the input-transform stage; return a :class:`Prepared` carrier.
+        squeeze: str = "",
+        dtype: str | None = None,
+        return_logits: bool = False,
+    ) -> torch.Tensor:
+        """Run the full model pipeline from a raw image — the everyday, safe path.
 
-        The split-out front half of :meth:`predict`: it owns the wrapper-level
-        validation (fp16-CPU, int-dtype, ndarray→tensor), the axes
-        canonicalisation, the gray→``in_chans`` channel synthesis, the mean/std
-        affine, and the XY conform. The device/dtype move stays in
-        :meth:`predict`, so the returned :class:`Prepared` is intentionally
-        device-neutral — a split caller can inspect or cache it on CPU before the
-        model touches it.
+        ``run`` = ``_apply_input → predict → (_restore | _apply_output)`` with every
+        recovery arg (``orig_yx`` / ``conform`` / ``axes``) threaded internally, so a
+        mismatch is impossible. The input is **channel-less** grayscale; ``axes`` may
+        not contain ``c``.
 
         Args:
-            x: Raw grayscale input — a float :class:`torch.Tensor` or
-                :class:`numpy.ndarray` (integer dtypes are rejected; the caller
-                scales int→float).
-            axes: One-character-per-axis string from ``{b,c,z,y,x}`` describing
-                ``x`` (same alphabet as :meth:`predict`).
-            norm: ``None`` → use ``config.mean``/``config.std``; ``'per-image'`` →
-                per-sample z-score (scale-invariant); ``'prenormalized'`` → skip
-                the affine; ``{'mean': m, 'std': s}`` → override. Out-of-``[0,1]``
-                mean/std or scaled input → warn-only
-                :class:`~omniem.errors.OmniEMWarning`.
-            conform: ``'strict'`` (default — reject non-square /
-                non-stride-multiple XY), ``'pad'`` (bottom/right
-                reflect-else-replicate to the next square multiple of the arch's
-                XY divisor; cropped back on un-conform), or ``'resize'`` (bicubic
-                XY-only interpolate; resized back on un-conform).
+            image: Raw grayscale float input (integer dtypes rejected).
+            axes: One-character-per-axis string from ``{b, z, y, x}`` describing
+                ``image``. Drives the output layout (the predicted ``c_out`` channel
+                is inserted after ``b`` if present, else at the front).
+            norm: ``None`` → ``config.mean``/``config.std``; ``'per-image'`` →
+                per-sample z-score; ``'prenormalized'`` → skip; ``{'mean': m,
+                'std': s}`` → **scalar** override.
+            conform: ``'strict'`` (default), ``'pad'`` (reflect/replicate, cropped
+                back), or ``'resize'`` (bicubic, resized back).
+            squeeze: A subset of ``{b, z}`` — drop the named singleton axis from the
+                output (else raise). Default ``""`` mirrors ``axes``.
+            dtype: Output integer dtype for the task output (``'uint8'`` default).
+                Must be ``None`` when ``return_logits=True`` (logits are not
+                quantized).
+            return_logits: ``False`` (default) → task output (needs
+                ``config.task_type``). ``True`` → restored caller-layout FLOAT logits
+                (channels intact, no task transform).
 
         Returns:
-            A frozen :class:`~omniem.prepared.Prepared` carrying the canonical
-            ``[B, C, Y, X', Z]`` tensor (``C == in_chans``; Z kept for the CNN
-            stem / z-fusion) plus the metadata :meth:`predict` needs to invert the
-            conform.
+            A :class:`torch.Tensor` — the task output (channel collapsed) or the
+            restored caller-layout logits, at the caller's original XY.
 
         Raises:
-            InputContractError: fp16-on-CPU; a non-float / wrong-type input; an
-                axes string that does not match ``x``; or a non-conforming XY
-                under ``conform='strict'``.
+            InputContractError: ``return_logits=True`` with a non-None ``dtype``;
+                ``return_logits=False`` with no ``config.task_type``; plus the usual
+                input-contract violations.
         """
-        # fp16 CPU guard — apply_input owns the wrapper
-        # validation. Without this guard a caller using the split
-        # path would hit a baffling kernel-not-implemented error later.
-        if self.dtype == torch.float16 and self.device.type == "cpu":
+        # Fail-fast on the cheap argument-contract errors BEFORE any (expensive)
+        # prep / forward, so a bad flag combo never pays for inference first.
+        if not isinstance(return_logits, bool):
             raise InputContractError(
-                "OmniEM is float16 on CPU — most CPU conv kernels do not support fp16."
+                f"OmniEM.run: `return_logits` must be a bool (got "
+                f"{type(return_logits).__name__}: {return_logits!r}); a truthy string "
+                f"like \"false\" or an int would silently pick the wrong path."
             )
-        x = self._coerce_input(x)
-        cleaned = _parse_axes(axes)
-        return self._build_prepared(x, cleaned=cleaned, norm=norm, conform=conform)
+        if return_logits and dtype is not None:
+            raise InputContractError(
+                "OmniEM.run: `dtype` must be None when return_logits=True — logits "
+                "are continuous floats, not a quantized image. Drop dtype= or set "
+                "return_logits=False."
+            )
+        if not return_logits and self._config.task_type is None:
+            raise InputContractError(
+                "OmniEM.run(return_logits=False) requires config.task_type "
+                "(\"image2image\" or \"image2label\") to pick the output transform. "
+                "The model has no task_type — call run(..., return_logits=True) and "
+                "postprocess the logits yourself."
+            )
+
+        tensor, orig_yx = self._apply_input(image, axes=axes, norm=norm, conform=conform)
+        logits = self.predict(tensor)
+        if return_logits:
+            return self._restore(
+                logits, axes=axes, orig_yx=orig_yx, conform=conform, squeeze=squeeze
+            )
+        return self._apply_output(
+            logits,
+            axes=axes,
+            orig_yx=orig_yx,
+            conform=conform,
+            squeeze=squeeze,
+            dtype=dtype if dtype is not None else "uint8",
+        )
+
+    # ---- predict (canonical compute) ---------------------------------------------
 
     def predict(
         self,
-        x: ArrayLike | Prepared,
+        tensor: torch.Tensor,
         *,
-        axes: str | None = None,
-        norm: None | str | Mapping[str, float | Sequence[float]] = None,
-        conform: str = "strict",
+        axes: object = None,
+        norm: object = None,
+        conform: object = None,
     ) -> torch.Tensor:
-        """Single-shot model forward — returns RAW model output at caller shape.
+        """Pure compute on a **canonical** ``[b, z, y, x]`` tensor → canonical logits.
 
-        ``x`` may be a raw tensor/ndarray OR a :class:`Prepared`
-        returned by :meth:`apply_input`. The type is the signal — no ``prepared=``
-        flag. Both forms execute ``compute → un-conform → caller-axes`` and
-        return logits at the caller's **original** Y,X — so
-        ``predict(apply_input(x)) == predict(x)`` exactly (split == one-shot).
-
-        When ``x`` is a :class:`Prepared`, ``axes`` / ``norm`` / ``conform`` MUST
-        be left at their defaults (they were already applied during
-        :meth:`apply_input`).
+        The power path: ``tensor`` is a pre-built canonical, channel-less,
+        **already-normalised** float tensor — ``z == config.img_z`` (``z=1`` for a
+        2D model), square + multiple-of-stride XY. ``predict`` validates the shape
+        strictly (no normalization inferred), builds the net input ``[B, 1, Y, X, Z]``
+        (preserving YX — never a ``y↔x`` swap), runs the net (it does its own
+        ``C==1→in_chans`` repeat), and permutes back to canonical logits
+        ``[b, c_out, z, y, x]``. No recovery (use :meth:`run` for caller-shape).
 
         Args:
-            x: Raw input (tensor/ndarray) OR a :class:`Prepared`.
-            axes: One-character-per-axis string from ``{b,c,z,y,x}`` (required
-                only when ``x`` is raw). Output mirrors ``axes`` with a ``c``
-                axis ALWAYS inserted right after ``b`` if present else first:
-                ``bzyx``→``bczyx``; ``zyx``→``czyx``; ``yx``→``cyx``.
-            norm: One of:
-                * ``None`` (default) — use ``config.mean``/``config.std``;
-                * ``'per-image'`` — per-sample z-score (scale-invariant);
-                * ``'prenormalized'`` — skip the affine;
-                * ``{'mean': m, 'std': s}`` — override.
-            conform: ``'strict'`` (default — reject non-conforming XY),
-                ``'pad'`` (bottom/right reflect-else-replicate; lossless
-                round-trip), or ``'resize'`` (bicubic; lossy round-trip).
+            tensor: Canonical ``[b, z, y, x]`` FLOAT tensor — integer tensors raise
+                (the package never scales int→float). Auto-moved/cast to the model's
+                device/dtype after validation.
+            axes / norm / conform: **Removed in 0.1.1.** Present only to detect the
+                old ``predict(raw, axes=…)`` call and raise a clear migration error.
 
         Returns:
-            ``torch.Tensor`` on ``self.device`` — **pure logits** at the
-            caller's ORIGINAL shape. For the canonical task output,
-            call :meth:`apply_output` on this tensor.
+            Canonical logits ``[b, c_out, z, y, x]`` on ``self.device``.
+        """
+        if axes is not None or norm is not None or conform is not None:
+            raise InputContractError(
+                "OmniEM.predict(x, axes=…/norm=…/conform=…) was removed in 0.1.1. "
+                "`predict` now takes only a canonical [b, z, y, x] tensor and returns "
+                "canonical logits [b, c_out, z, y, x]. Use `model.run(image, axes=…)` "
+                "for a raw image, or build the canonical tensor and call "
+                "`model.predict(canonical)`."
+            )
+        if self.dtype == torch.float16 and self.device.type == "cpu":
+            raise InputContractError(
+                "OmniEM is float16 on CPU — most CPU conv kernels do not support fp16."
+            )
+        if not isinstance(tensor, torch.Tensor):
+            raise InputContractError(
+                f"OmniEM.predict expects a canonical [b, z, y, x] torch.Tensor "
+                f"(got {type(tensor).__name__}); use run(image, axes=…) for raw input."
+            )
+        if not tensor.is_floating_point():
+            raise InputContractError(
+                f"OmniEM.predict expects a FLOAT canonical tensor (got dtype="
+                f"{tensor.dtype}); the package never scales int→float (uint8 != ÷255). "
+                f"Use run(image, axes=…) for raw input, or cast first."
+            )
+        if tensor.ndim != 4:
+            raise InputContractError(
+                f"OmniEM.predict expects a canonical 4D [b, z, y, x] tensor "
+                f"(got ndim={tensor.ndim}, shape={tuple(tensor.shape)}); z=1 for a 2D "
+                f"model. Use run(image, axes=…) to canonicalise a raw image."
+            )
+        B, Z, Y, X = (int(d) for d in tensor.shape)
+        if B <= 0 or Z <= 0 or Y <= 0 or X <= 0:
+            raise InputContractError(
+                f"OmniEM.predict: empty axis (got B={B}, Z={Z}, Y={Y}, X={X})."
+            )
+        expected_z = int(self._config.img_z)
+        if Z != expected_z:
+            raise InputContractError(
+                f"OmniEM.predict: z must equal config.img_z={expected_z} (got z={Z}); "
+                f"flexible Z is not supported."
+            )
+        stride = self._stride
+        if Y != X or Y % stride != 0:
+            raise InputContractError(
+                f"OmniEM.predict: XY must be square + a multiple of stride={stride} "
+                f"(got {Y}x{X}); conform via run(image, axes=…, conform='pad'|'resize')."
+            )
+
+        # Move + cast onto the model (after validation).
+        if tensor.device != self.device or tensor.dtype != self.dtype:
+            tensor = tensor.to(device=self.device, dtype=self.dtype)
+
+        # Build the net input [B, 1, Y, X, Z] — canonical [B, Z, Y, X] → unsqueeze a
+        # channel → permute Z to last. YX order is preserved (the net's local X,Y
+        # variable names are legacy/internal; never a public y↔x swap). The net does
+        # its own C==1→in_chans repeat.
+        x5 = tensor.unsqueeze(1).permute(0, 1, 3, 4, 2).contiguous()  # [B, 1, Y, X, Z]
+        raw = self._net(x5)  # [B, C_out, Y, X, Z] — PURE LOGITS
+        # Permute back to canonical [B, C_out, Z, Y, X].
+        return raw.permute(0, 1, 4, 2, 3).contiguous()
+
+    # ---- internal prep stage ------------------------------------------------------
+
+    def _apply_input(
+        self,
+        image: ArrayLike,
+        *,
+        axes: str,
+        norm: None | str | Mapping[str, float] = None,
+        conform: str = "strict",
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        """Internal prep stage — return ``(canonical[b, z, y, x], orig_yx)``.
+
+        Owns the wrapper validation (fp16-CPU, int-dtype, ndarray→tensor), the axes
+        canonicalisation to channel-less ``[b, z, y, x]``, the XY conform
+        (``strict|pad|resize``), and the **scalar** mean/std affine. Channel
+        synthesis is the net's concern (``C==1→in_chans``). ``run`` threads the
+        returned ``orig_yx`` into ``_restore`` / ``_apply_output`` (single source of
+        truth — never recomputed).
         """
         if self.dtype == torch.float16 and self.device.type == "cpu":
             raise InputContractError(
                 "OmniEM is float16 on CPU — most CPU conv kernels do not support fp16."
             )
+        x = self._coerce_input(image)
+        cleaned = _parse_axes(axes)
+        if x.ndim != len(cleaned):
+            raise InputContractError(
+                f"image.ndim ({x.ndim}) does not match axes={cleaned!r} "
+                f"(length {len(cleaned)})"
+            )
 
-        if isinstance(x, Prepared):
-            # Prepared-mode: axes/norm/conform are baked in — reject overrides.
-            if axes is not None:
+        # Reorder to canonical [B, Z, Y, X], adding singletons for missing axes.
+        order = ["b", "z", "y", "x"]
+        present = set(cleaned)
+        perm = [cleaned.index(ax) for ax in order if ax in present]
+        x = x.permute(*perm) if perm else x
+        pos = 0
+        for ax in order:
+            if ax not in present:
+                x = x.unsqueeze(pos)
+            pos += 1
+
+        B, Z, Y, X = x.shape
+        orig_yx = (int(Y), int(X))
+        if B <= 0 or Z <= 0 or Y <= 0 or X <= 0:
+            raise InputContractError(
+                f"OmniEM.apply_input: empty spatial / batch axis (got B={B}, Z={Z}, "
+                f"Y={Y}, X={X}); inputs must have positive size."
+            )
+        expected_z = int(self._config.img_z)
+        if Z != expected_z:
+            raise InputContractError(
+                f"Z must equal config.img_z={expected_z}; got Z={Z}. "
+                f"Flexible/same-padded Z is not supported."
+            )
+
+        # Per-image: capture per-sample stats on the PRE-CONFORM input.
+        per_image = isinstance(norm, str) and norm == _PER_IMAGE
+        pi_mean: torch.Tensor | None = None
+        pi_std: torch.Tensor | None = None
+        if per_image:
+            pi_mean, pi_std = _per_image_stats(x.to(torch.float32))
+        elif norm != _PRENORMALIZED:
+            _warn_tensor_out_of_unit_range(x.to(torch.float32), what="OmniEM input")
+
+        stride = self._stride
+        if conform == "strict":
+            if Y != X:
                 raise InputContractError(
-                    "OmniEM.predict: `axes` must be omitted when x is a Prepared "
-                    "(axes is baked into Prepared.axes)."
+                    f"XY must be square (got Y={Y}, X={X}); EM is in-plane isotropic."
                 )
-            if norm is not None:
+            if Y % stride != 0:
                 raise InputContractError(
-                    "OmniEM.predict: `norm` must be omitted when x is a Prepared "
-                    "(the affine was already applied during apply_input)."
+                    f"XY side must be a multiple of stride={stride}; got {Y}."
                 )
-            if conform != "strict":
-                raise InputContractError(
-                    "OmniEM.predict: `conform` must be omitted when x is a Prepared "
-                    "(the conform was already applied during apply_input)."
-                )
-            self._validate_prepared(x)
-            prepared = x
+        elif conform == "pad":
+            x = _conform_pad_xy(x, stride=stride)
+        elif conform == "resize":
+            x = _conform_resize_xy(x, stride=stride)
         else:
-            if axes is None:
-                raise InputContractError(
-                    "OmniEM.predict: `axes` is required for raw input (pass a Prepared "
-                    "via x= to skip; see apply_input)."
-                )
-            x = self._coerce_input(x)
-            cleaned = _parse_axes(axes)
-            prepared = self._build_prepared(x, cleaned=cleaned, norm=norm, conform=conform)
+            raise InputContractError(
+                f"conform must be one of 'pad', 'resize', 'strict' (got {conform!r})"
+            )
 
-        x5d = prepared.tensor
-        # Move + cast onto the model.
-        if x5d.device != self.device or x5d.dtype != self.dtype:
-            x5d = x5d.to(device=self.device, dtype=self.dtype)
+        # Float cast for the normalisation arithmetic.
+        x = x.to(torch.float32)
 
-        # Forward — OmniEMV1Net returns [B, C_out, Y, X', Z'] (PURE LOGITS).
-        raw = self._net(x5d)
+        if per_image:
+            assert pi_mean is not None and pi_std is not None
+            m = pi_mean.to(device=x.device).view(B, 1, 1, 1)
+            s = pi_std.to(device=x.device).view(B, 1, 1, 1)
+            x = ((x - m) / s).to(x.dtype)
+        else:
+            x = _apply_norm(x, config=self._config, norm=norm)
 
-        # Un-conform XY back to the caller's original (orig_yx): the un-conform
-        # lives in predict so both raw and Prepared forms return caller-shape.
-        raw = self._unconform_xy(raw, prepared=prepared)
+        return x, orig_yx
 
-        # Reshape to caller axes. Output ALWAYS carries a `c` axis (out_channels)
-        # — `c` collapses only in apply_output (image2image squeeze C=1; image2label argmax).
-        return self._to_caller_axes(raw, cleaned=prepared.axes, B=prepared.B)
+    # ---- internal recover stages -------------------------------------------------
 
-    # ---- output stage ------------------------------------------------------------
-
-    def apply_output(
+    def _restore(
         self,
         logits: torch.Tensor,
         *,
         axes: str,
-        dtype: str = "uint8",
+        orig_yx: tuple[int, int],
+        conform: str,
+        squeeze: str = "",
     ) -> torch.Tensor:
-        """Model-owned output stage — task_type-gated, derived transform.
+        """Un-conform XY + reshape canonical logits → caller ``axes`` (+ ``squeeze``).
 
-        ``axes`` is the
-        SAME axes string the caller gave :meth:`predict`; the channel axis is
-        derived via :func:`omniem.prepared.channel_axis_from_axes` (``c`` after
-        ``b`` if present, else axis 0) — the single source of truth shared with
-        :meth:`_to_caller_axes`. Runs only on caller-axes logits (the output of
-        :meth:`predict`, one-shot or :class:`Prepared` form).
-
-        Requires :attr:`self.config.task_type` (else :class:`InputContractError`).
-        The transform is derived from ``task_type``, never passed:
-
-        * ``image2image`` → ``sigmoid → clamp[0,1] → ·(2ⁿ-1) → round → dtype``
-          then **squeeze the C=1 channel** (the single-channel collapse).
-        * ``image2label`` → ``argmax`` over the channel axis → class map as
-          ``dtype``. The 1-ch threshold branch is gone (image2label is
-          ``out_channels>=2`` by construction).
-
-        Both task outputs **collapse the channel axis**.
-
-        Args:
-            logits: The raw model output from :meth:`predict`. Shape mirrors
-                ``axes`` with a ``c`` axis inserted right after ``b`` if
-                present, else first (``yx→cyx``, ``byx→bcyx``, ``zyx→czyx``,
-                ``bzyx→bczyx``). ``logits.shape[channel_axis]`` must equal
-                ``self.config.out_channels``.
-            axes: The caller's axes string (same one passed to :meth:`predict`).
-            dtype: ``'uint8'`` (default) or ``'uint16'``. For ``image2label``,
-                ``out_channels - 1`` must fit in the chosen dtype.
-
-        Returns:
-            A :class:`torch.Tensor` with the channel axis collapsed. Device
-            unchanged.
-
-        Raises:
-            InputContractError: ``task_type`` is unset; ``dtype`` unknown; the
-                logits channel-axis size disagrees with
-                ``self.config.out_channels``; or the image2label class count
-                overflows ``dtype``.
+        ``logits`` is canonical ``[B, C_out, Z, Y, X]`` (from :meth:`predict`). The
+        un-conform runs on the **continuous logits** before any task transform
+        (caller path: :meth:`run` with ``return_logits=True``). Output channel is
+        inserted per :func:`omniem._pipeline.channel_insert`.
         """
-        from omniem.models import output as _output  # local — avoids import cycle on package init
+        cleaned = _parse_axes(axes)
+        drop = parse_squeeze(squeeze)
+        restored, labels = self._unconform_and_layout(
+            logits, cleaned=cleaned, orig_yx=orig_yx, conform=conform
+        )
+        restored, _ = _drop_squeeze(restored, labels, drop)
+        return restored
+
+    def _apply_output(
+        self,
+        logits: torch.Tensor,
+        *,
+        axes: str,
+        orig_yx: tuple[int, int],
+        conform: str,
+        squeeze: str,
+        dtype: str,
+    ) -> torch.Tensor:
+        """Model-owned output stage — un-conform → task transform → collapse → squeeze.
+
+        Runs ``_restore``'s un-conform + caller layout (keeping ``c``), then the
+        ``task_type``-gated transform (``image2image``: sigmoid+quantize;
+        ``image2label``: argmax — both **collapse the channel axis**), then applies
+        ``squeeze`` (exactly once). Requires ``config.task_type``.
+        """
+        from omniem.models import output as _output  # local — avoids import cycle
 
         task_type = self._config.task_type
         if task_type is None:
             raise InputContractError(
-                "model.apply_output requires config.task_type "
-                "(\"image2image\" or \"image2label\"); the model has no task_type "
-                "so it cannot decide the output transform — postprocess the raw "
-                "logits yourself."
+                "model output stage requires config.task_type "
+                "(\"image2image\" or \"image2label\"); the model has no task_type so "
+                "it cannot decide the output transform — use run(..., "
+                "return_logits=True) and postprocess the logits yourself."
             )
+        _output._resolve_dtype(dtype)  # surface an unknown dtype early
 
-        if not isinstance(logits, torch.Tensor):
-            raise InputContractError(
-                f"apply_output expects a torch.Tensor (got {type(logits).__name__})"
-            )
-        # predict returns float logits; an integer tensor is a contract violation
-        # (image2image would silently round to 0/255 after sigmoid; image2label
-        # would silently accept ints "as logits"). Reject loudly.
-        if not logits.is_floating_point():
-            raise InputContractError(
-                f"apply_output expects FLOAT logits (got dtype={logits.dtype}). "
-                f"OmniEM.predict returns floats; integer tensors are not valid logits."
-            )
-        # Resolve dtype name early so unknown values surface with a clear error.
-        _output._resolve_dtype(dtype)
-
-        # Derive the channel axis from the caller's `axes` (shared rule).
-        # The single source of truth lives in
-        # ``channel_axis_from_axes`` so this matches ``_to_caller_axes`` exactly.
-        cleaned_axes = _parse_axes(axes)
-        ch_axis = channel_axis_from_axes(cleaned_axes)
-        # Validate the EXACT rank of caller-axes logits. The
-        # rule mirrors what _to_caller_axes constructs: a `c` axis inserted at
-        # ch_axis (right after `b` if present, else axis 0), then the SPATIAL
-        # axes from the caller's axes string. Input `c` (if any) is ignored —
-        # predict drops it before inserting the output channel.
-        spatial = sum(1 for a in cleaned_axes if a in ("y", "x", "z"))
-        leading_b = 1 if "b" in cleaned_axes else 0
-        expected_ndim = leading_b + 1 + spatial  # +1 for the inserted c axis
-        if logits.ndim != expected_ndim:
-            raise InputContractError(
-                f"apply_output (axes={axes!r}): caller-axes logits ndim must be "
-                f"{expected_ndim} (leading b={leading_b} + c=1 + spatial={spatial}); "
-                f"got shape {tuple(logits.shape)}. apply_output runs only on the "
-                f"output of predict — pass the same axes string you gave predict."
-            )
-        actual_c = int(logits.shape[ch_axis])
+        cleaned = _parse_axes(axes)
+        drop = parse_squeeze(squeeze)
+        restored, labels = self._unconform_and_layout(
+            logits, cleaned=cleaned, orig_yx=orig_yx, conform=conform
+        )
+        ch_axis = labels.index("c")
+        actual_c = int(restored.shape[ch_axis])
         expected_c = int(self._config.out_channels)
         if actual_c != expected_c:
             raise InputContractError(
-                f"apply_output (axes={axes!r}): logits channel-axis size "
-                f"{actual_c} (dim {ch_axis}) disagrees with "
-                f"config.out_channels={expected_c}"
+                f"output stage (axes={axes!r}): logits channel size {actual_c} "
+                f"(dim {ch_axis}) disagrees with config.out_channels={expected_c}."
             )
 
         if task_type == "image2image":
-            # config validator ensured out_channels == 1; defensive recheck.
             if expected_c != 1:
                 raise InputContractError(
                     f"task_type='image2image' implies out_channels==1; got {expected_c}"
                 )
-            return _output._apply_image2image(logits, ch_axis=ch_axis, dtype=dtype)
-
-        if task_type == "image2label":
-            # Label dtype overflow: highest class id is out_channels - 1; the
-            # caller must use a dtype that can hold it.
+            out = _output._apply_image2image(restored, ch_axis=ch_axis, dtype=dtype)
+        elif task_type == "image2label":
             full_scale, _ = _output._resolve_dtype(dtype)
             if expected_c - 1 > full_scale:
                 raise InputContractError(
-                    f"task_type='image2label' with out_channels={expected_c} "
-                    f"does not fit in dtype={dtype!r} (max class id "
-                    f"{expected_c - 1} > {full_scale}); use 'uint16'."
+                    f"task_type='image2label' with out_channels={expected_c} does not "
+                    f"fit in dtype={dtype!r} (max class id {expected_c - 1} > "
+                    f"{full_scale}); use 'uint16'."
                 )
-            return _output._apply_image2label(logits, ch_axis=ch_axis, dtype=dtype)
+            out = _output._apply_image2label(restored, ch_axis=ch_axis, dtype=dtype)
+        else:  # pragma: no cover — Literal already constrains task_type
+            raise InputContractError(f"Unknown task_type={task_type!r}")
 
-        # Defensive: Literal already constrains task_type.
-        raise InputContractError(f"Unknown task_type={task_type!r}")
+        # The channel axis is gone; the remaining labels keep their order.
+        labels_after = [a for a in labels if a != "c"]
+        out, _ = _drop_squeeze(out, labels_after, drop)
+        return out
+
+    # ---- migration stubs (removed public surface) --------------------------------
+
+    def apply_input(self, *args: Any, **kwargs: Any):
+        """Removed in 0.1.1 — use :meth:`run` / build a canonical for :meth:`predict`."""
+        raise InputContractError(
+            "OmniEM.apply_input was removed in 0.1.1 (no more Prepared carrier). "
+            "Use `model.run(image, axes=…)` for the full pipeline, or build a "
+            "canonical [b, z, y, x] tensor and call `model.predict(canonical)`."
+        )
+
+    def apply_output(self, *args: Any, **kwargs: Any):
+        """Removed in 0.1.1 — :meth:`run` owns the output stage."""
+        raise InputContractError(
+            "OmniEM.apply_output was removed in 0.1.1. Use "
+            "`model.run(image, axes=…)` for the task output (or "
+            "`run(..., return_logits=True)` for caller-layout logits)."
+        )
 
     # ---- training handoff ---------------------------------------------------------
 
@@ -911,336 +1031,146 @@ class OmniEM(nn.Module):
             f"(got {type(x).__name__})"
         )
 
-    def _build_prepared(
+    def _unconform_and_layout(
         self,
-        image: torch.Tensor,
+        logits: torch.Tensor,
         *,
         cleaned: str,
-        norm: None | str | Mapping[str, float | Sequence[float]],
+        orig_yx: tuple[int, int],
         conform: str,
-    ) -> Prepared:
-        """Axes fold → conform XY → channel synthesis → normalise → :class:`Prepared`.
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Un-conform XY then reshape canonical logits to the caller layout.
 
-        Axes fold → conform XY → channel synthesis → normalise → Prepared.
-        The conform step (strict/pad/resize) sits between the axes
-        fold and the channel synthesis so the conform math always runs on a
-        clean ``[B, 1, Y, X, Z]`` grid.
+        ``logits`` is canonical ``[B, C_out, Z, Y, X]``. Returns ``(tensor, labels)``
+        where ``labels`` is the ordered axis list of the output (still **carrying
+        ``c``**; the task transform / squeeze run afterwards). Rule 1 (axes drives
+        layout) + rule 2 (never drop a non-singleton ``b``/``z``) are enforced here.
         """
-        if image.ndim != len(cleaned):
+        # Validate the logits tensor itself (type / rank / float) before reading its
+        # XY dims — a bad internal call surfaces a clear InputContractError rather than
+        # a raw IndexError / unpack failure. ``predict`` produces a 5D float canonical;
+        # this guards direct ``_restore`` / ``_apply_output`` callers (incl. tests).
+        if not isinstance(logits, torch.Tensor):
             raise InputContractError(
-                f"image.ndim ({image.ndim}) does not match axes={cleaned!r} "
-                f"(length {len(cleaned)})"
+                f"logits must be a torch.Tensor (got {type(logits).__name__})."
             )
-
-        # Reorder to canonical [B, C, Y, X, Z], adding singletons for missing axes.
-        order = ["b", "c", "y", "x", "z"]
-        present = set(cleaned)
-        perm = [cleaned.index(ax) for ax in order if ax in present]
-        x = image.permute(*perm) if perm else image
-        new_shape: list[int] = []
-        idx = 0
-        for ax in order:
-            if ax in present:
-                new_shape.append(x.shape[idx])
-                idx += 1
-            else:
-                new_shape.append(1)
-        x = x.reshape(*new_shape)  # [B, C, Y, X, Z]
-
-        B, C, H, W, Z = x.shape
-        orig_yx = (int(H), int(W))
-
-        # Empty-axis guard — H == 0 / W == 0 / B == 0 would
-        # pass the strict 0 % stride == 0 check and then make F.pad / interpolate
-        # surface raw torch errors. Reject at the wrapper layer with a clear
-        # message instead.
-        if B <= 0 or H <= 0 or W <= 0:
+        if logits.ndim != 5:
             raise InputContractError(
-                f"OmniEM.apply_input: empty spatial / batch axis (got B={B}, "
-                f"Y={H}, X={W}); inputs must have positive size."
+                f"logits must be canonical 5D [B, C, Z, Y, X] (got ndim={logits.ndim}, "
+                f"shape={tuple(logits.shape)})."
             )
-
-        # Z must equal config.img_z exactly (flexible Z is not supported).
-        expected_z = self._config.img_z
-        if Z != expected_z:
+        if not logits.is_floating_point():
             raise InputContractError(
-                f"Z must equal config.img_z={expected_z}; got Z={Z}. "
-                f"Flexible/same-padded Z is not supported."
+                f"logits must be a FLOAT tensor (got dtype={logits.dtype}); "
+                f"predict returns float logits."
             )
-
-        # Per-image: capture per-sample stats on the PRE-CONFORM input; applied at
-        # the norm slot below. The scaled-input [0,1] range warning fires for
-        # model/argument norm only.
-        per_image = isinstance(norm, str) and norm == _PER_IMAGE
-        pi_mean: torch.Tensor | None = None
-        pi_std: torch.Tensor | None = None
-        if per_image:
-            pi_mean, pi_std = _per_image_stats(x.to(torch.float32))
-        elif norm != _PRENORMALIZED:
-            _warn_tensor_out_of_unit_range(x.to(torch.float32), what="OmniEM input")
-
-        stride = self._stride
-        pad_or_scale: dict = {}
-        if conform == "strict":
-            # XY square + multiple of stride (omniemv1: 112 = lcm(ViT 14, omniem 16)).
-            if H != W:
-                raise InputContractError(
-                    f"XY must be square (got Y={H}, X={W}); EM is in-plane isotropic."
-                )
-            if H % stride != 0:
-                raise InputContractError(
-                    f"XY side must be a multiple of stride={stride}; got {H}."
-                )
-        elif conform == "pad":
-            x, pad_y, pad_x, new_h, new_w = _conform_pad_xy(x, stride=stride)
-            pad_or_scale = {
-                "pad_y": int(pad_y),
-                "pad_x": int(pad_x),
-                "target": int(new_h),
-            }
-            H, W = new_h, new_w
-        elif conform == "resize":
-            x, target = _conform_resize_xy(x, stride=stride)
-            pad_or_scale = {"target": int(target)}
-            H = W = target
-        else:
-            raise InputContractError(
-                f"conform must be one of 'pad', 'resize', 'strict' (got {conform!r})"
-            )
-
-        # Channels — EM is grayscale: C in {1, in_chans}; synthesize to in_chans.
-        in_chans = int(self._net.vit.patch_embed.in_chans)
-        if C == 1:
-            x = x.repeat(1, in_chans, 1, 1, 1)
-            C = in_chans
-        elif C != in_chans:
-            raise InputContractError(
-                f"expected C in {{1, {in_chans}}} (EM is grayscale); got C={C}."
-            )
-
-        # Float cast for the normalisation arithmetic.
-        x = x.to(torch.float32)
-
-        # Normalise once — config.mean/std unless `prenormalized` / override /
-        # per-image. Per-image uses the PRE-CONFORM stats (broadcast over B).
-        if per_image:
-            assert pi_mean is not None and pi_std is not None
-            m = pi_mean.to(device=x.device).view(B, 1, 1, 1, 1)
-            s = pi_std.to(device=x.device).view(B, 1, 1, 1, 1)
-            # Cast back to x.dtype for dtype consistency (x is float32 here, so a no-op;
-            # kept symmetric with the encoder path and robust if the cast moves).
-            x = ((x - m) / s).to(x.dtype)
-        else:
-            x = _apply_norm(x, channels=C, config=self._config, norm=norm)
-
-        return Prepared(
-            tensor=x,
-            axes=cleaned,
-            conform=conform,  # type: ignore[arg-type]
-            orig_yx=orig_yx,
-            pad_or_scale=pad_or_scale,
-            B=int(B),
-            Z=int(Z),
-            stride=int(stride),
-        )
-
-    def _validate_prepared(self, prepared: Prepared) -> None:
-        """Validate a :class:`Prepared` before consuming it in :meth:`predict`.
-
-        The prepared-mode path takes
-        an arbitrary user-constructed (or apply_input-built) ``Prepared`` and
-        runs compute / un-conform / remap on it. Reject not just the tensor
-        body but also the meta the un-conform/remap trusts (``axes``,
-        ``conform``, ``orig_yx``, ``B``, ``Z``), so a malformed Prepared
-        surfaces here rather than producing the wrong caller shape.
-        """
-        # Meta first (cheap) — invalid meta would mislead un-conform/remap.
-        if not isinstance(prepared.axes, str) or not prepared.axes:
-            raise InputContractError(
-                f"Prepared.axes must be a non-empty string (got {prepared.axes!r})"
-            )
-        # Run the same axes parser predict uses on raw input so axes errors
-        # surface with the same diagnostics.
-        cleaned_axes = _parse_axes(prepared.axes)
-        if prepared.conform not in ("pad", "resize", "strict"):
-            raise InputContractError(
-                f"Prepared.conform must be 'pad'/'resize'/'strict' "
-                f"(got {prepared.conform!r})"
-            )
-        if not (isinstance(prepared.orig_yx, tuple) and len(prepared.orig_yx) == 2):
-            raise InputContractError(
-                f"Prepared.orig_yx must be a (Y, X) tuple (got {prepared.orig_yx!r})"
-            )
-        oy, ox = prepared.orig_yx
+        oy, ox = orig_yx
         if not (isinstance(oy, int) and isinstance(ox, int) and oy > 0 and ox > 0):
             raise InputContractError(
-                f"Prepared.orig_yx must be positive ints (got {prepared.orig_yx!r})"
+                f"orig_yx must be positive ints (got {orig_yx!r})."
             )
-
-        t = prepared.tensor
-        if not isinstance(t, torch.Tensor):
-            raise InputContractError(
-                f"Prepared.tensor must be a torch.Tensor (got {type(t).__name__})"
-            )
-        if not torch.is_floating_point(t):
-            raise InputContractError(
-                f"Prepared.tensor must be floating-point (got dtype={t.dtype})"
-            )
-        if t.ndim != 5:
-            raise InputContractError(
-                f"Model-prepared tensor must be 5D [B, C, Y, X, Z] (got ndim={t.ndim}, "
-                f"shape={tuple(t.shape)})"
-            )
-        in_chans = int(self._net.vit.patch_embed.in_chans)
-        if t.shape[1] != in_chans:
-            raise InputContractError(
-                f"Prepared.tensor channel count {int(t.shape[1])} != in_chans={in_chans} "
-                f"(apply_input synthesises the channels — pass raw grayscale to it instead)."
-            )
-        H, W, Z = int(t.shape[2]), int(t.shape[3]), int(t.shape[4])
-        if Z != self._config.img_z:
-            raise InputContractError(
-                f"Prepared.tensor Z={Z} != config.img_z={self._config.img_z}."
-            )
-        stride = self._stride
-        if H != W or H <= 0 or H % stride != 0:
-            raise InputContractError(
-                f"Prepared.tensor XY must be square + multiple of stride={stride} "
-                f"(got {H}x{W})."
-            )
-        if prepared.stride != stride:
-            raise InputContractError(
-                f"Prepared.stride={prepared.stride} disagrees with model stride={stride}. "
-                f"(encoder Prepared.stride=14 / ViT patch; model Prepared.stride=112 / "
-                f"omniemv1 input divisor.)"
-            )
-        # B/Z consistency vs the tensor shape so the un-conform
-        # / _to_caller_axes that read the meta don't drop or duplicate rows.
-        if prepared.B != int(t.shape[0]):
-            raise InputContractError(
-                f"Prepared.B={prepared.B} != tensor batch dim {int(t.shape[0])}."
-            )
-        if prepared.Z != int(t.shape[4]):
-            raise InputContractError(
-                f"Prepared.Z={prepared.Z} != tensor Z dim {int(t.shape[4])}."
-            )
-        # Omitted-axis singletons. _to_caller_axes drops B if
-        # axes lacks 'b' (raw[0]) and squeezes the trailing Z if axes lacks 'z'
-        # — but `squeeze(-1)` is a no-op when Z > 1, and dropping raw[0] for
-        # B > 1 silently loses data. Reject a Prepared whose tensor has a non-1
-        # B / Z that the caller's axes string did not declare.
-        if "b" not in cleaned_axes and int(t.shape[0]) != 1:
-            raise InputContractError(
-                f"Prepared.axes={prepared.axes!r} has no 'b' but tensor batch dim "
-                f"is {int(t.shape[0])} > 1 — _to_caller_axes would silently drop "
-                f"all but raw[0]. Add 'b' to axes or batch one tile at a time."
-            )
-        if "z" not in cleaned_axes and int(t.shape[4]) != 1:
-            raise InputContractError(
-                f"Prepared.axes={prepared.axes!r} has no 'z' but tensor Z dim is "
-                f"{int(t.shape[4])} > 1 — _to_caller_axes would silently keep the "
-                f"Z axis. Add 'z' to axes."
-            )
-        # Strict orig_yx must match the tensor (no transform happened); pad/resize
-        # orig_yx must NOT exceed the conformed XY.
-        if prepared.conform == "strict":
-            if (oy, ox) != (H, W):
-                raise InputContractError(
-                    f"Prepared.orig_yx={prepared.orig_yx} but conform='strict' and the "
-                    f"tensor is {H}x{W} (strict is a no-op round-trip)."
-                )
-        else:
-            if oy > H or ox > W:
-                raise InputContractError(
-                    f"Prepared.orig_yx={prepared.orig_yx} exceeds conformed XY ({H}x{W})."
-                )
-
-    def _unconform_xy(
-        self,
-        raw: torch.Tensor,
-        *,
-        prepared: Prepared,
-    ) -> torch.Tensor:
-        """Reverse the conform XY step so logits land at the caller's original (Y, X).
-
-        The un-conform lives in predict so both forms
-        (one-shot and split) return caller-shape. ``'strict'`` is a no-op
-        round-trip (orig_yx already matches).
-
-        Args:
-            raw: ``[B, C_out, Y', X', Z']`` from the net (Y', X' may be the
-                conformed side).
-            prepared: the :class:`Prepared` whose meta describes how to invert
-                the conform.
-
-        Returns:
-            ``[B, C_out, orig_Y, orig_X, Z']``.
-        """
-        conform = prepared.conform
-        orig_y, orig_x = prepared.orig_yx
+        # logits canonical [B, C, Z, Y, X] — Y,X are the last two dims.
+        Hc, Wc = int(logits.shape[3]), int(logits.shape[4])
         if conform == "strict":
-            return raw
-        if conform == "pad":
-            # Bottom/right pad → crop is the trivial last-2 slice.
-            return raw[..., :orig_y, :orig_x, :]
-        if conform == "resize":
-            # Bicubic XY-only resize back — fold (B, Z) → B*Z and use 4D interpolate.
-            B, C, Hp, Wp, Zd = raw.shape
-            x4 = raw.permute(0, 4, 1, 2, 3).reshape(B * Zd, C, Hp, Wp).to(dtype=torch.float32)
-            x4 = torch.nn.functional.interpolate(
-                x4,
-                size=(int(orig_y), int(orig_x)),
-                mode="bicubic",
-                align_corners=False,
+            if (oy, ox) != (Hc, Wc):
+                raise InputContractError(
+                    f"orig_yx={orig_yx} but conform='strict' and the logits XY is "
+                    f"{Hc}x{Wc} (strict is a no-op round-trip)."
+                )
+        elif conform == "pad":
+            if oy > Hc or ox > Wc:
+                raise InputContractError(
+                    f"orig_yx={orig_yx} exceeds the conformed XY ({Hc}x{Wc}) — cannot "
+                    f"crop a pad round-trip back to a larger size."
+                )
+            logits = logits[..., :oy, :ox]
+        elif conform == "resize":
+            logits = self._resize_logits_xy(logits, (oy, ox))
+        else:
+            raise InputContractError(
+                f"_restore: unknown conform mode {conform!r}."
             )
-            return (
-                x4.reshape(B, Zd, C, orig_y, orig_x)
-                .permute(0, 2, 3, 4, 1)
-                .to(dtype=raw.dtype)
-            )
-        raise InputContractError(
-            f"_unconform_xy: unknown conform mode {conform!r}"
-        )
+
+        # Reshape canonical [B, C, Z, Y, X] → caller layout (channel inserted per the
+        # shared rule). Drop b/z the caller did not name (rule 2: must be singleton).
+        return self._to_caller_axes(logits, cleaned=cleaned)
 
     def _to_caller_axes(
         self,
-        raw: torch.Tensor,
+        logits: torch.Tensor,
         *,
         cleaned: str,
-        B: int,
-    ) -> torch.Tensor:
-        """Reshape raw ``[B, C_out, Y, X, Z]`` to caller-axes order.
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Reshape canonical ``[B, C_out, Z, Y, X]`` logits to caller-axes order.
 
-        Output shape MIRRORS the caller's ``axes`` — a leading
-        ``b`` in ``axes`` keeps a batch axis (even at B==1); no ``b`` → no batch
-        axis. A ``c`` axis is ALWAYS present (the model's ``out_channels``)
-        inserted right after ``b`` if present, else leading. Spatial axes
-        (``y``/``x``/``z``) follow the caller's order.
+        Output mirrors the caller's (channel-less) ``axes`` with ``c_out`` inserted
+        per :func:`omniem._pipeline.channel_insert` (after ``b`` if present, else
+        front). ``b``/``z`` the caller did not name are dropped — but only when
+        singleton (rule 2). Returns ``(tensor, labels)``.
 
         Examples:
-            * ``axes='yx'`` → ``[C, Y, X]`` (Z dropped — caller didn't ask for z)
+            * ``axes='yx'``  → ``[C, Y, X]``       (B,Z dropped — must be singleton)
             * ``axes='zyx'`` → ``[C, Z, Y, X]``
-            * ``axes='bzyx'`` → ``[B, C, Z, Y, X]``
             * ``axes='byx'`` → ``[B, C, Y, X]``
-            * ``axes='cyx'`` → ``[C, Y, X]`` (input c is ignored for output layout)
+            * ``axes='bzyx'``→ ``[B, C, Z, Y, X]``
+            * ``axes='byxz'``→ ``[B, C, Y, X, Z]``  (downstream [B,C,Y,X,Z] path)
         """
         has_b = "b" in cleaned
         has_z = "z" in cleaned
-        # raw is [B, C_out, Y, X, Z].
-        # Drop Z if the caller didn't include it.
+        B = int(logits.shape[0])
+        Z = int(logits.shape[2])
+        if not has_b and B != 1:
+            raise InputContractError(
+                f"axes={cleaned!r} has no 'b' but the batch dim is {B} > 1 — the "
+                f"output layout would silently drop all but the first. Add 'b' to "
+                f"axes or run one tile at a time."
+            )
+        if not has_z and Z != 1:
+            raise InputContractError(
+                f"axes={cleaned!r} has no 'z' but the depth dim is {Z} > 1 — the "
+                f"output layout would silently drop the z axis. Add 'z' to axes."
+            )
+        internal = ["b", "c", "z", "y", "x"]
+        # Drop z (dim 2) then b (dim 0) for axes the caller omitted (singleton-safe).
         if not has_z:
-            raw = raw.squeeze(-1)  # [B, C, Y, X]
-        # Drop B if the caller didn't include it (single-shot view).
+            logits = logits.squeeze(2)
+            internal.remove("z")
         if not has_b:
-            raw = raw[0]  # [C, ...]
-            internal = ["c"] + (["y", "x", "z"] if has_z else ["y", "x"])
-            spatial_order = [ax for ax in cleaned if ax in ("y", "x", "z")]
-            target = ["c", *spatial_order]
-        else:
-            internal = ["b", "c"] + (["y", "x", "z"] if has_z else ["y", "x"])
-            spatial_order = [ax for ax in cleaned if ax in ("y", "x", "z")]
-            target = ["b", "c", *spatial_order]
-        return _reorder_axes(raw, internal=internal, target=target)
+            logits = logits.squeeze(0)
+            internal.remove("b")
+        spatial_order = [ax for ax in cleaned if ax in ("y", "x", "z") and ax in internal]
+        target = (["b"] if has_b else []) + spatial_order
+        # The predicted c_out is inserted per the shared channel_insert rule (after
+        # b if present, else front) — the single source of truth.
+        target.insert(channel_insert(cleaned), "c")
+        out = _reorder_axes(logits, internal=internal, target=target)
+        return out, target
+
+    def _resize_logits_xy(
+        self,
+        logits: torch.Tensor,
+        orig_yx: tuple[int, int],
+    ) -> torch.Tensor:
+        """Bicubic-resize the canonical ``[B, C, Z, Y, X]`` logits XY back to ``orig_yx``.
+
+        Folds ``(B, Z) → B*Z`` so the 4D interpolate touches only the last two
+        (Y, X) axes, then un-folds. Z is never resized.
+        """
+        B, C, Z, Hp, Wp = logits.shape
+        oy, ox = int(orig_yx[0]), int(orig_yx[1])
+        x4 = (
+            logits.permute(0, 2, 1, 3, 4)
+            .reshape(B * Z, C, Hp, Wp)
+            .to(dtype=torch.float32)
+        )
+        x4 = torch.nn.functional.interpolate(
+            x4, size=(oy, ox), mode="bicubic", align_corners=False
+        )
+        return (
+            x4.reshape(B, Z, C, oy, ox)
+            .permute(0, 2, 1, 3, 4)
+            .to(dtype=logits.dtype)
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -1425,6 +1355,15 @@ def _parse_axes(axes: str) -> str:
     cleaned = "".join(axes.split())
     seen: set[str] = set()
     for ax in cleaned:
+        if ax == "c":
+            # Channel-less contract: the model is grayscale-in; `in_chans` is a
+            # model-internal detail. Declaring an RGB-stored layout with `c` is a
+            # CLI-only concern (`--axes cyx` + `--color-to-gray`).
+            raise InputContractError(
+                f"`axes` must not contain 'c' — OmniEM takes grayscale input only "
+                f"(channel-less); the model synthesises `in_chans` itself. See "
+                f"docs/input-format.md (got axes={axes!r})."
+            )
         if ax not in _AXES_VALID:
             raise InputContractError(
                 f"Unknown axis {ax!r} in axes={axes!r}; allowed: {sorted(_AXES_VALID)}"
@@ -1437,6 +1376,37 @@ def _parse_axes(axes: str) -> str:
     if "y" not in cleaned or "x" not in cleaned:
         raise InputContractError(f"`axes` must include both 'y' and 'x' (got axes={axes!r})")
     return cleaned
+
+
+def _drop_squeeze(
+    tensor: torch.Tensor,
+    labels: list[str],
+    drop: frozenset[str],
+) -> tuple[torch.Tensor, list[str]]:
+    """Drop the ``squeeze``-named ``b``/``z`` axes from ``tensor`` (singleton-only).
+
+    ``labels`` is the ordered axis list of ``tensor``. Each axis in ``drop`` must be
+    present and singleton (else raise). ``z`` is removed before ``b`` so the
+    remaining indices stay valid (``b`` is leftmost). Returns ``(tensor, labels)``.
+    """
+    labels = list(labels)
+    for ax in ("z", "b"):
+        if ax not in drop:
+            continue
+        if ax not in labels:
+            raise InputContractError(
+                f"squeeze={ax!r} but the output has no {ax!r} axis (it was not in "
+                f"`axes`, or was already collapsed)."
+            )
+        idx = labels.index(ax)
+        if int(tensor.shape[idx]) != 1:
+            raise InputContractError(
+                f"squeeze={ax!r} requires a singleton axis (got size "
+                f"{int(tensor.shape[idx])}); a non-singleton {ax!r} cannot be squeezed."
+            )
+        tensor = tensor.squeeze(idx)
+        labels.remove(ax)
+    return tensor, labels
 
 
 def _reorder_axes(
@@ -1458,24 +1428,25 @@ def _reorder_axes(
 def _apply_norm(
     x: torch.Tensor,
     *,
-    channels: int,
     config: ModelConfig,
-    norm: None | str | Mapping[str, float | Sequence[float]],
+    norm: None | str | Mapping[str, float],
 ) -> torch.Tensor:
-    """Apply ``(x − mean) / std`` per the ``norm=`` directive.
+    """Apply **scalar** ``(x − mean) / std`` per the ``norm=`` directive.
 
-    Handles the fixed/override/skip cases. ``'per-image'`` is NOT handled here — it
-    needs the pre-conform tensor and is applied by :meth:`_build_prepared` upstream.
+    Operates on the channel-less ``[B, Z, Y, X]`` grid. Handles the
+    fixed/override/skip cases. ``'per-image'`` is NOT handled here — it needs the
+    pre-conform tensor and is applied by :meth:`_apply_input` upstream.
 
     * ``norm is None`` → use ``config.mean`` / ``config.std`` (the model's
       FIXED training normalisation).
     * ``norm == 'prenormalized'`` → skip the affine (caller already did it).
-    * ``norm`` is a mapping with EXACT keys ``{'mean', 'std'}`` → override.
+    * ``norm`` is a mapping with EXACT keys ``{'mean', 'std'}`` → **scalar**
+      override (per-channel sequences are rejected — EM is grayscale).
     """
     if isinstance(norm, str):
         if norm == _PRENORMALIZED:
             return x
-        # 'per-image' is valid at the public API but is handled in _build_prepared
+        # 'per-image' is valid at the public API but is handled in _apply_input
         # (it needs the pre-conform tensor); it never reaches here.
         raise InputContractError(
             f"norm={norm!r} unknown; allowed: None, '{_PRENORMALIZED}', "
@@ -1500,22 +1471,19 @@ def _apply_norm(
             f"norm must be None, 'prenormalized', or a dict; got {type(norm).__name__}."
         )
 
-    m_t = _to_channel_tensor(eff_mean, channels, device=x.device, name="mean")
-    s_t = _to_channel_tensor(eff_std, channels, device=x.device, name="std", positive=True)
-    m_t = m_t.view(1, channels, 1, 1, 1)
-    s_t = s_t.view(1, channels, 1, 1, 1)
+    m_t = _to_scalar_param(eff_mean, device=x.device, name="mean")
+    s_t = _to_scalar_param(eff_std, device=x.device, name="std", positive=True)
     return (x - m_t) / s_t
 
 
-def _to_channel_tensor(
-    v: float | Sequence[float],
-    channels: int,
+def _to_scalar_param(
+    v: float,
     *,
     device: torch.device,
     name: str = "mean/std",
     positive: bool = False,
 ) -> torch.Tensor:
-    """Scalar / per-channel mean-or-std → ``[channels]`` tensor, validated."""
+    """Validate a **scalar** mean-or-std → 0-d tensor. Per-channel sequences rejected."""
     if isinstance(v, bool):
         raise InputContractError(f"{name} must be numeric (got bool)")
     if isinstance(v, (int, float)):
@@ -1524,32 +1492,17 @@ def _to_channel_tensor(
             raise InputContractError(f"{name} must be finite (got {v!r})")
         if positive and f <= 0:
             raise InputContractError(f"{name} must be strictly positive (got {v!r})")
-        return torch.full((channels,), f, device=device, dtype=torch.float32)
+        return torch.tensor(f, device=device, dtype=torch.float32)
     if isinstance(v, (str, bytes, bytearray)):
         raise InputContractError(f"{name} must be numeric, not a string (got {v!r})")
-    if not isinstance(v, Sequence):
+    if isinstance(v, Sequence):
         raise InputContractError(
-            f"{name} must be a scalar or numeric per-channel sequence "
-            f"(got {type(v).__name__})"
+            f"{name} must be a SCALAR (got a sequence {v!r}); per-channel mean/std is "
+            f"rejected — EM is grayscale, the synthesised channels are identical."
         )
-    try:
-        vec = [float(t) for t in v]
-    except (TypeError, ValueError) as e:
-        raise InputContractError(
-            f"{name} per-channel sequence must be numeric (got {v!r})"
-        ) from e
-    if not all(math.isfinite(t) for t in vec):
-        raise InputContractError(f"{name} values must be finite (got {v!r})")
-    if positive and any(t <= 0 for t in vec):
-        raise InputContractError(f"{name} values must be strictly positive (got {v!r})")
-    arr = torch.tensor(vec, device=device, dtype=torch.float32)
-    if arr.numel() == 1:
-        return arr.expand(channels).contiguous()
-    if arr.numel() != channels:
-        raise InputContractError(
-            f"{name} length must be 1 or {channels} (got {arr.numel()})"
-        )
-    return arr
+    raise InputContractError(
+        f"{name} must be a numeric scalar (got {type(v).__name__})"
+    )
 
 
 def _load_raw_state_dict(path: Path) -> dict[str, Any]:
@@ -1708,38 +1661,32 @@ def _conform_pad_xy(
     x: torch.Tensor,
     *,
     stride: int,
-) -> tuple[torch.Tensor, int, int, int, int]:
+) -> torch.Tensor:
     """Reflect-else-replicate pad XY (bottom/right) to a square multiple of stride.
 
-    Operates on a 5D ``[B, C, Y, X, Z]`` tensor. Folds ``(B, Z) → B*Z`` so the
-    pad touches only XY (a naïve 5D ``F.pad`` would need a fragile padding
-    tuple), pads ``(0, pad_x, 0, pad_y)`` bottom/right on the 4D view, then
-    unfolds. Per-axis mode = ``reflect`` when the pad amount is ``<`` the
-    corresponding input axis length, else ``replicate`` (PyTorch ``reflect``
-    requires pad < dim).
+    Operates on a channel-less 4D ``[B, Z, Y, X]`` tensor. Folds ``(B, Z) → B*Z``
+    (adding a singleton channel) so the pad touches only XY, pads ``(0, pad_x, 0,
+    pad_y)`` bottom/right on the 4D view, then unfolds. Per-axis mode = ``reflect``
+    when the pad amount is ``<`` the corresponding input axis length, else
+    ``replicate`` (PyTorch ``reflect`` requires pad < dim). The pad is bottom/right,
+    so the un-conform crop (``_restore``) is the trivial ``[..., :Y, :X]`` slice.
 
-    Returns:
-        ``(padded_5d, pad_y, pad_x, new_h, new_w)``.
+    Returns the padded ``[B, Z, target, target]`` tensor.
     """
-    B, C, H, W, Z = x.shape
+    B, Z, H, W = x.shape
     target = _ceil_to_multiple(max(H, W), stride)
     pad_y = target - H
     pad_x = target - W
     if pad_y == 0 and pad_x == 0:
-        return x, 0, 0, H, W
+        return x
 
-    # Fold (B, Z) → B*Z for a 4D pad.
-    x4 = x.permute(0, 4, 1, 2, 3).reshape(B * Z, C, H, W)
+    # Fold (B, Z) → B*Z with a singleton channel for a 4D pad.
+    x4 = x.reshape(B * Z, 1, H, W)
 
-    # PER-AXIS mode. PyTorch ``reflect`` requires the pad
-    # amount on EACH axis to be strictly less than that axis' input length;
-    # ``replicate`` has no such constraint. To keep the "good" axis on the more
-    # natural ``reflect`` mode even when the other axis needs ``replicate``,
-    # apply X first then Y (or vice versa), each with its own mode.
+    # PER-AXIS mode: ``reflect`` requires the pad amount on each axis < that axis'
+    # input length; ``replicate`` has no such constraint.
     needs_replicate_y = pad_y >= H
     needs_replicate_x = pad_x >= W
-    # X first (last two dims of a 4D tensor are H, W → F.pad's first two pad
-    # values control W). Then Y on the result.
     if pad_x > 0:
         x4 = torch.nn.functional.pad(
             x4,
@@ -1753,42 +1700,34 @@ def _conform_pad_xy(
             mode="replicate" if needs_replicate_y else "reflect",
         )
 
-    x5 = x4.reshape(B, Z, C, target, target).permute(0, 2, 3, 4, 1)
-    return x5, int(pad_y), int(pad_x), int(target), int(target)
+    return x4.reshape(B, Z, target, target)
 
 
 def _conform_resize_xy(
     x: torch.Tensor,
     *,
     stride: int,
-) -> tuple[torch.Tensor, int]:
-    """Bicubic-resize XY (fold-XY-only) of a 5D ``[B, C, Y, X, Z]`` tensor.
+) -> torch.Tensor:
+    """Bicubic-resize XY (fold-XY-only) of a channel-less 4D ``[B, Z, Y, X]`` tensor.
 
-    A naïve 5D ``F.interpolate`` would rescale Z too — that's the wrong
-    operation. Fold ``(B, Z) → B*Z``, run 4D bicubic on the resulting
-    ``[B*Z, C, Y, X]``, then unfold. Resized to a square ``target = ceil(max(Y,X)
-    / stride) * stride``.
+    Z is never resized. Fold ``(B, Z) → B*Z`` (singleton channel), run 4D bicubic on
+    ``[B*Z, 1, Y, X]``, then unfold. Resized to a square
+    ``target = ceil(max(Y, X) / stride) * stride``. A no-op when already-conforming.
 
-    Returns ``(resized_5d, target)``; when already-conforming, the resize is a
-    no-op and ``target`` matches ``Y == X``.
+    Returns the resized ``[B, Z, target, target]`` tensor.
     """
-    B, C, H, W, Z = x.shape
+    B, Z, H, W = x.shape
     target = _ceil_to_multiple(max(H, W), stride)
     if H == target and W == target:
-        return x, int(target)
-    x4 = x.permute(0, 4, 1, 2, 3).reshape(B * Z, C, H, W).to(dtype=torch.float32)
+        return x
+    x4 = x.reshape(B * Z, 1, H, W).to(dtype=torch.float32)
     x4 = torch.nn.functional.interpolate(
         x4,
         size=(target, target),
         mode="bicubic",
         align_corners=False,
     )
-    x5 = (
-        x4.reshape(B, Z, C, target, target)
-        .permute(0, 2, 3, 4, 1)
-        .to(dtype=x.dtype)
-    )
-    return x5, int(target)
+    return x4.reshape(B, Z, target, target).to(dtype=x.dtype)
 
 
 __all__ = ["OmniEM"]

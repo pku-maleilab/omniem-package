@@ -4,6 +4,6 @@ construction helper is :mod:`.build`; the no-OOP forward function is :mod:`.forw
 """
 
 from omniem.encoders.dinov2.build import build
-from omniem.encoders.dinov2.forward import forward_features
+from omniem.encoders.dinov2.forward import compute_encoder, prepare_encoder_input
 
-__all__ = ["build", "forward_features"]
+__all__ = ["build", "compute_encoder", "prepare_encoder_input"]
